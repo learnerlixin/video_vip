@@ -7,6 +7,15 @@
     mountEpBar(...)             →  Ui.ep_bar(...)
 
 有 rich 时用 rich 渲染（彩色/面板/进度条），否则退回纯 print。
+
+输出的两条视觉约定（调用点不必传样式，也不该各传各的）：
+
+    颜色看首符号   ✓ 绿 / ✗ 红 / ⚠ 黄 / ℹ↻⬇ 与进度行蓝灰 —— 由 _style_of 自动判
+    分块看来源     同一条链路的连续状态行（搜索 → 命中 → 解析 → 起播 → 选集网格）
+                   都是 `flow`，彼此不空行；只有换来源才空一行：后台线程插播 `bg`、
+                   独立面板 `section()` / `start_block()`、banner `boot`。
+                   面板自带细横线框（_rule）；用户敲下的那行命令回显本身就是分隔线，
+                   所以 `_input` 读完一行就把块标记清零，不在它下面再补空行。
 """
 
 from __future__ import annotations
@@ -62,6 +71,61 @@ def _ep_short(ep: Dict[str, str], idx: int) -> str:
     return name
 
 
+def order_choice(
+    candidates: List[Dict[str, Any]],
+    detail_map: Optional[Dict[Any, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """候选选择面板的排序：**名称匹配度优先**，其次压掉带编号的续集，年份只作
+    同分内的兜底（最新在前）。
+
+    年份原本排在最前，实测搜「年会不能停」时 2025 的续集「年会不能停2：水到渠成」
+    会凭年份抢走 ⭐推荐，把用户要的 2023 本片挤到第 2 项——用户没点名续集就不该抢位。
+    """
+    detail_map = detail_map or {}
+
+    def year_of(c: Dict[str, Any]) -> int:
+        d = detail_map.get(c["id"])
+        if not d:
+            return 0
+        try:
+            return int(d.get("vod_year") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return sorted(
+        candidates,
+        key=lambda c: (-(c.get("_score") or 0),
+                       1 if c.get("_sequel") else 0,
+                       -year_of(c)),
+    )
+
+
+# 消息首字符 → (类别, rich 颜色)。颜色只用 256 色里的柔和档，避免默认高饱和色
+# 在一屏里互相抢注意力。类别只是色名的注释性分组，**分块不看类别**（看 block）。
+_MARK_KIND: tuple = (
+    ("✓", "ok", "color(114)"),        # 绿：这一步做成了
+    ("✗", "err", "color(203)"),       # 红：这一步没成
+    ("⚠", "warn", "color(214)"),      # 黄：做成了，但有个坑得知道
+    ("ℹ", "note", "color(117)"),      # 蓝：中性说明（例如某参数被忽略）
+    ("↻", "note", "color(117)"),      # 重载
+    ("⬇", "note", "color(117)"),      # 抽流 / 下载
+)
+_STYLE_INFO = "color(117)"            # 「正在 X 搜索…」这类进度行
+
+
+def _style_of(msg: str) -> str:
+    """按文案首字符挑颜色。
+
+    全项目的 toast 文案本来就以符号开头（✓ 成功 / ✗ 失败 / ⚠ 警告 / ℹ 说明），
+    所以分类**不需要调用方传参** —— cli.py 里近百处 `ui.toast` 一行不改就能各归各的色。
+    """
+    head = (msg or "").lstrip()
+    for mark, _kind, style in _MARK_KIND:
+        if head.startswith(mark):
+            return style
+    return _STYLE_INFO
+
+
 class Ui:
     """UI 后端接口。默认实现走终端（rich 可用时上色）。"""
 
@@ -82,6 +146,9 @@ class Ui:
         self._out_lock = threading.RLock()
         self._prompt: str = ""
         self._input_active: bool = False
+        # 上一行属于哪个来源块（flow/bg/sec:xxx/panel/boot）。来源一变就空一行，
+        # 让「流水状态 / 后台插播 / 命令表 / 选集网格」各自成块。
+        self._last_block: str = ""
 
     # ── 输出原语 ──────────────────────────────────────────────────────────
     def _print(self, text: str, style: str = "", soft_wrap: bool = False) -> None:
@@ -111,17 +178,68 @@ class Ui:
             self._prompt = prompt
             self._input_active = True
         try:
-            if self.console is not None:
-                return self.console.input(prompt)
-            return input(prompt)           # pragma: no cover
+            raw = (self.console.input(prompt) if self.console is not None
+                   else input(prompt))            # pragma: no cover
         finally:
             with self._out_lock:
                 self._input_active = False
                 self._prompt = ""
+        # 用户敲下的那行命令本身就是一条分隔线：命令回显下面别再补空行，
+        # 否则「敲 20 → 空行 → 正在播放 → 空行 → 选集」会把一件事拉成三截。
+        with self._out_lock:
+            self._last_block = ""
+        return raw
 
-    # ── toast(msg, autoHide) ──────────────────────────────────────────────
-    def toast(self, msg: str, auto_hide: bool = True) -> None:
+    # ── 分块与分类输出 ────────────────────────────────────────────────────
+    def _rule(self) -> str:
+        """一条与内容等宽收的细横线，用来框住面板类块。"""
+        return "─" * min(max(self._term_width() - 4, 20), 56)
+
+    def _gap(self, block: str) -> None:
+        """来源块与上一行不同就空一行（程序开头第一条不空，避免莫名一个空白行）。"""
+        if self._last_block and self._last_block != block:
+            self._print("")
+        self._last_block = block
+
+    def _print_styled(self, text: str, style: str, block: str) -> None:
+        """分块 + 上色 + 落一行，`toast` 与 `set_status` 共用这一条路径。"""
+        with self._out_lock:
+            self._gap(block)
+            self._print(text, style=style, soft_wrap=True)
+
+    def start_block(self, block: str = "panel") -> None:
+        """面板/表格这类输出自己声明开一块：与上一块之间空一行。
+
+        调用方随后不必再关心分块 —— 下一条 `toast` 换来源时同样会自动空行。
+        """
+        with self._out_lock:
+            self._gap(block)
+
+    def section(self, title: str, style: str = "bold color(117)",
+                *, block: Optional[str] = None) -> None:
+        """带标题的块起点：默认标题就是块名，所以换标题必然空一行。
+
+        `--list` 的「[内嵌播放] / [弹窗播放不带选集] / [播放后端] / [缓存目录]」用的
+        就是默认 —— 四块本来平级，紧挨着打就分不清哪行属于哪块。
+
+        传 `block`（如 `flow`）则是**贴在当前块里**只打个标题、不空行：选集网格走这条，
+        因为「✓ 正在播放 第20集」和下面那张网格说的是同一件事，中间插空行反倒像两件
+        不相干的东西（标题 + 细横线已经足够把它俩跟上面的流水分开）。
+        """
+        with self._out_lock:
+            self._gap(f"sec:{title.strip()}" if block is None else block)
+            self._print(title, style=style)
+
+    def toast(self, msg: str, auto_hide: bool = True, *, block: str = "flow") -> None:
         """终端没有「2.5 秒后自动消失」的概念，auto_hide 仅保留签名一致性。
+
+        颜色按 `_style_of(msg)` 自动选（✓ 绿 / ✗ 红 / ⚠ 黄 / 其余蓝灰）：文案里的符号
+        本来就是分类依据，没必要让近百处调用点各传一遍参数。
+
+        `block` 才是**分块**依据，与颜色无关：同一条链路上的进度与结果（搜索 → 命中
+        → 解析 → 起播）都是默认的 `flow`，连续打印时彼此不空行 —— 它们说的是同一件事，
+        行间隔开会把工作流切成碎片。只有换来源才空行：`bg` 是后台线程插播（浏览器打开
+        回执、自动连播、预取里程碑），面板走 `section()` / `start_block()`。
 
         soft_wrap=True：toast 是「一行状态」，不该被 rich 按词折行。
         rich 默认会在 `✓`/`⚠` 后面的空格处断行，长文案时把 emoji 甩成
@@ -129,7 +247,7 @@ class Ui:
         自己按字符硬折行，emoji 才不会落单。
         """
         del auto_hide
-        self._print(f"  {msg}", style="color(117)", soft_wrap=True)
+        self._print_styled(f"  {msg}", _style_of(msg), block)
 
     # ── ui.setStatus / hidePlaceholder ────────────────────────────────────
     def set_status(self, text: str) -> None:
@@ -137,7 +255,7 @@ class Ui:
         if text == self._status:
             return
         self._status = text
-        self._print(f"· {text}", style="dim", soft_wrap=True)
+        self._print_styled(f"· {text}", "dim", "flow")
 
     def hide_status(self) -> None:
         self._status = ""
@@ -162,24 +280,12 @@ class Ui:
     ) -> Dict[str, Any]:
         """多候选选择面板。返回用户选中的候选（dict，含 id/name/_score）。
 
-        排序：年份优先（最新在前），同年份内名称匹配度优先。
+        排序见 order_choice：**名称匹配度优先**，其次压掉带编号的续集，年份只作
+        同分内的兜底（最新在前）。
         回车选第 1 项（⭐推荐）；输入序号选指定项；q / Ctrl-C 抛 KeyboardInterrupt。
         """
         detail_map = detail_map or {}
-
-        def year_of(c: Dict[str, Any]) -> int:
-            d = detail_map.get(c["id"])
-            if not d:
-                return 0
-            try:
-                return int(d.get("vod_year") or 0)
-            except (TypeError, ValueError):
-                return 0
-
-        ordered = sorted(
-            candidates,
-            key=lambda c: (-year_of(c), -(c.get("_score") or 0)),
-        )
+        ordered = order_choice(candidates, detail_map)
 
         rows: List[str] = []
         for i, c in enumerate(ordered):
@@ -196,6 +302,7 @@ class Ui:
 
         body = "\n".join(rows)
         head = f"搜到多个相关结果，请选择要播放的（共 {len(ordered)} 个）"
+        self.start_block()               # 面板自成一块，别贴在上一条进度下面
         if self.console is not None and _HAS_RICH:
             self.console.print(
                 Panel(Text(body), title=head, border_style="color(117)", expand=False)
@@ -258,11 +365,15 @@ class Ui:
         cur_idx: int,
         indent: int = 4,
         title: str = "",
+        block: Optional[str] = "flow",
     ) -> None:
         """把全部集数排成自适应终端宽度的多列网格，用 `[N]` 高亮当前集。
 
         每格补齐到固定槽宽（cw+2），ASCII 括号宽度恒为 1，避免因 ▶◀ 这类
         模糊宽度字符或分隔空格让最后一格溢出换行。CJK 宽度用 _disp_width 对齐。
+
+        网格默认**贴在播放状态那一块里**（`block="flow"`，见 `section`）：换集后
+        「正在播第几集」和「整季在哪」是一组信息，被空行劈开就成了一堆碎行。
         """
         if not eps:
             return
@@ -275,7 +386,10 @@ class Ui:
         cols = max(1, (self._term_width() - indent) // slot)
         rows = (len(cell_txt) + cols - 1) // cols
         pref = f"《{title}》" if title else ""
-        self._print(f"  {pref}选集（共 {len(eps)} 集，敲数字或 n/p 换集）:", style="dim")
+        rule = self._rule()
+        self.section(f"  {pref}选集（共 {len(eps)} 集，敲数字或 n/p 换集）:",
+                     style="dim", block=block)
+        self._print("  " + rule, style="dim")
         for r in range(rows):
             cells: List[str] = []
             for c in range(cols):
@@ -287,6 +401,7 @@ class Ui:
                 cells.append(wrapped + " " * (slot - _disp_width(wrapped)))
             self._print(pad_left + "  " + "".join(cells).rstrip(),
                         style="color(110)", soft_wrap=True)
+        self._print("  " + rule, style="dim")
 
     # ── 命令速查面板 ──────────────────────────────────────────────────────
     def render_help(self, tips: Optional[List[str]] = None) -> None:
@@ -300,8 +415,8 @@ class Ui:
             ("n / p", "下一集 / 上一集"),
             ("<数字>", "跳到第 N 集"),
             ("l", "列出全部集数"),
-            ("m", "重选影片"),
-            ("s", "切换解析源"),
+            ("m [片名]", "重选影片（可指定官方站）"),
+            ("s [编号]", "换解析源（保持当前集）"),
             ("r", "重新加载"),
             ("a", "开关自动解析"),
             ("x", "开关自动连播"),
@@ -316,15 +431,21 @@ class Ui:
         left, right = cells[:nrows], cells[nrows:]
         lw = max(_disp_width(c) for c in left)
         gap = 4
-        rule = "─" * min(max(self._term_width() - 4, 20), 56)
-        self._print("  命令速查", style="bold color(117)")
+        rule = self._rule()
+        self.section("  命令速查")            # 与上一块（搜索/解析进度）之间空一行
         self._print("  " + rule, style="dim")
         for i in range(nrows):
             r = right[i] if i < len(right) else ""
             line = "  " + left[i] + " " * (lw - _disp_width(left[i]) + gap) + r
             self._print(line.rstrip(), style="color(110)", soft_wrap=True)
         self._print("  " + rule, style="dim")
-        for t in (tips or []):
+        # 一行式写法光看命令表猜不出来，所以常驻提示；调用方给的 tips 追加在后面。
+        default_tips = [
+            "一行式：m 片名 [site 官方站] 直接换片、s 编号/源名 直接换源"
+            "（如 m 嫁金钗 site 爱奇艺、s 4）",
+            "只写 m / s 则逐项追问；其余命令不带参数",
+        ]
+        for t in [*default_tips, *(tips or [])]:
             self._print("  " + t, style="dim", soft_wrap=True)
 
 
@@ -418,7 +539,8 @@ class SilentUi(Ui):
         del soft_wrap
         self.logs.append(text)
 
-    def toast(self, msg: str, auto_hide: bool = True) -> None:
+    def toast(self, msg: str, auto_hide: bool = True, *, block: str = "flow") -> None:
+        del block            # 静默模式下不画块，签名与基类保持一致即可
         self.logs.append(msg)
 
     def set_status(self, text: str) -> None:

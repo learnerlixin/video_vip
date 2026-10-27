@@ -14,13 +14,15 @@
 - [快速开始](#快速开始)
 - [交互命令](#交互命令)
 - [解析源与 `--source`](#解析源与---source)
-- [片名 → 官方页 URL](#片名--官方页-urlsite_searchpy)
+- [片名 → 官方页 URL](#片名--官方页-urlsrcsite_searchpy)
 - [播放后端](#播放后端)
 - [自动连播](#自动连播--auto-next--x)
 - [保存为 mp4](#保存为-mp4--save--d)
-- [HLS 并发预取](#hls-并发预取prefetchpy)
-- [第三方源抽流](#第三方源抽流jx_resolvepy)
+- [HLS 并发预取](#hls-并发预取srcprefetchpy)
+- [第三方源抽流](#第三方源抽流srcjx_resolvypy)
+- [目录结构](#目录结构)
 - [模块一览](#模块一览)
+- [测试](#测试)
 - [核心流程](#核心流程)
 - [实现上的取舍](#实现上的取舍)
 - [已验证](#已验证)
@@ -36,8 +38,11 @@
 # 方式零：不带任何参数启动 —— 进程序后再交互式选播放方式/片名或URL/解析源/集数
 python -m video_vip
 
-# 方式一：给视频页 URL（完整流程：识别片名 → 搜索 → 选片 → 取 m3u8 → 播放）
+# 方式一：给视频页 URL（注入该页 → 选解析源 → 起播；只认这个页面）
 python -m video_vip https://v.qq.com/x/cover/rjae621myqca41h/i0032qxbi2v.html
+
+# 方式一′：URL 与 --title 同时给 —— 只认 URL，--title 忽略（剧名以页面识别为准）
+python -m video_vip https://v.qq.com/x/cover/rjae621myqca41h/i0032qxbi2v.html -s 4
 
 # 方式二：直接按片名搜索（跳过页面抓取）
 python -m video_vip --title 庆余年
@@ -45,8 +50,11 @@ python -m video_vip --title 庆余年
 # 方式三：只给片名也能走第三方解析源（自动站内搜索找到官方页 URL）
 python -m video_vip --title 庆余年 --episode 5 -s 2 --site 爱奇艺
 
-# 只保存不播放
+# 只保存不播放（默认走无损云直连）
 python -m video_vip --title 庆余年 --episode 5 --save
+
+# 只保存不播放，且指定用第三方源抽流下载（解析页 → 明文 m3u8）
+python -m video_vip --title 庆余年 --episode 5 -s 4 --save
 
 # 列出解析源与本机可用播放后端
 python -m video_vip --list
@@ -57,18 +65,18 @@ python -m video_vip --list
 | 参数 | 说明 |
 |---|---|
 | `url` | 视频页 URL（等价于浏览器里打开这个页面） |
-| `-t, --title` | 跳过页面抓取，直接用这个片名搜索 |
+| `-t, --title` | 跳过页面抓取，直接用这个片名搜索（**同时给了 URL 时以 URL 为准，`--title` 忽略**） |
 | `-e, --episode N` | 指定播放第几集（从 1 开始） |
-| `-s, --source N` | 解析源编号（`--list` 查看）；默认 `1` LX解析 |
-| `--site` | `{腾讯视频,爱奇艺,优酷,芒果TV}` 配合 `--title`+第三方源，限定优先去哪家官方站找页 |
+| `-s, --source N` | 解析源编号（`--list` 查看）；播放默认 `1` LX解析，`--save` 默认 `0` 无损云 |
+| `--site` | `{腾讯视频,爱奇艺,优酷,芒果TV}` 配合 `--title`+第三方源，**优先**去哪家官方站找页（那家没命中会兜底到其它三家并提示） |
 | `-p, --player` | `{auto,prefetch,mpv,ffplay,embed,browser}`；默认 `embed` |
 | `--prefetch-workers N` | 预取并发数（默认 8） |
 | `--prefetch-ahead N` | 起播前预取的分片数（默认 4） |
 | `--keep-cache` | 退出后保留预取的分片缓存 |
-| `--save` | 只保存为 mp4，不播放 |
+| `--save` | 只保存为 mp4，不播放；显式 `-s` 第三方源时走「解析页抽流」下载 |
 | `--out PATH` | 保存路径（文件或目录） |
-| `--variant` | `{highest,lowest,auto}` 清晰度选择 |
-| `--workers N` | 下载并发数（默认 8） |
+| `--variant` | `{highest,lowest}` 清晰度选择（默认 highest） |
+| `--prefetch-workers` | 下载/预取并发数（默认 8，`--save` 复用同一个值，不另开旋钮） |
 | `--auto-next` | 一集播完自动切下一集 |
 | `--no-auto` | 不自动解析，只打印菜单 |
 | `--no-interact` | 播完不进交互循环，直接退出 |
@@ -87,8 +95,8 @@ python -m video_vip --list
 | `n` / `p` | 下一集 / 上一集 |
 | `<数字>` | 跳到第 N 集 |
 | `l` | 列出全部集数（自适应多列网格，`[N]` 高亮当前集） |
-| `m` | 重选影片（沿用当前解析源，回到第 1 集） |
-| `s` | 切换解析源（沿用当前片名，回到第 1 集） |
+| `m [片名]` | 重选影片（沿用当前解析源、**可临时换官方站**，回到第 1 集） |
+| `s [编号]` | 切换解析源（同一影片、**保持在播的那一集**） |
 | `r` | 重新加载当前集 |
 | `a` | 开/关自动解析 |
 | `x` | 开/关自动连播 |
@@ -97,10 +105,50 @@ python -m video_vip --list
 | `h` | 查看帮助 |
 | `q` | 退出 |
 
-**`m` 与 `s` 统一重跑**：循环内记住「当前片名 + 当前解析源」，改其中一项会用新的组合
-重新起播并回到第 1 集，不会再把另一项重置回默认。第三方解析源解析的是**具体视频页**，
-所以「换片名 + 第三方源」时会借道站内搜索（`find_page_url`）定位该片名在官方站的页面
-再喂给所选源；找不到就如实回退无损云。无损云会话（无视频页）也能用 `s` 换到第三方源。
+**`m` 与 `s` 各自记住的东西不同**：循环内记住「当前片名 + 当前解析源 + 优先官方站 +
+整季入口页」。
+* `m` 换片名 → 换一部片子，理应从**第 1 集**开始；如果当前是第三方源，会再问一次
+  「到哪家官方站找」（回车沿用上次选的站），因为第三方源解析的是官方站的页面，
+  同一部片在腾讯/爱奇艺/优酷/芒果TV 都能拿到不同的页；无损云按片名直连、不分官方站，
+  所以不问。源本身不变（不会一换片名就被重置回无损云）。
+* `s` 换解析源 → 同一影片换个解析接口，**保持在播的那一集**：直接拿当前集的官方页
+  （选集栏里那条 `source.url + 官方页` 去掉前缀）重解析，而不是会话最初那一页；
+  否则看到第 5 集换个源就被拽回第 1 集。枚举不出整季、定不到那一集时会如实说明。
+第三方源借道站内搜索（`find_page_url`）定位官方页；找不到就如实回退无损云。
+无损云会话（无视频页）也能用 `s` 换到第三方源（同样带上当前集号）。
+
+### 一行式：把追问折叠进命令
+
+只有 `m` / `s` 支持带参数，其余命令一律不带参数（`n 3` 会被拒绝而不是静默执行 `n`）：
+
+| 写法 | 效果 |
+|---|---|
+| `m 嫁金钗` | 直接换到该片名，不再追问片名/官方站 |
+| `m 嫁金钗 site 爱奇艺` | 换片名**并**把爱奇艺排到站内搜索第一位（简称可写，腾讯/芒果 → 腾讯视频/芒果TV） |
+| `m` | 老写法：逐项追问片名、再到哪家官方站找 |
+| `s 4` | 直接切到 4 号源（`--list` 里的编号），保持在播那一集 |
+| `s 麒麟` | 按源名切：先按前缀唯一命中，再退回包含匹配 |
+| `s p4` / `s p 4` | 切到 4 号源并**弹窗**播放（无损云没有可弹窗的解析页，会如实拒绝） |
+| `s` | 老写法：列出源菜单挑编号 |
+
+紧凑写法 `m嫁金钗` / `s4`（不带空格）同样认——中文输入法下不打空格是很自然的动作。
+三条硬约束值得留意，它们都是踩过坑之后定下来的：
+
+* **参数不参与 `lower()`**：整行小写会把 `m Osiris 之泪` 的片名削成小写，而片名正是
+  站内搜索的关键词，字面变了召回就跟着变。
+* **整词命令优先于紧凑拆分**：`save` 必须先按整词命中，否则会被拆成 `s` + `ave`，
+  切到一个不存在的解析源上（判据是 `_KNOWN_CMDS`）。
+* **认不出参数就拒绝执行**：把「哔哩哔哩」当片名硬搜、把一个歧义源名硬切过去，
+  都比原地不动更糟，所以一律报错并列出可用值（`_split_site_arg` / `_resolve_source_arg`）。
+
+**`site` 是优先站，不是硬限定**：写 `site 爱奇艺` 只是把爱奇艺提到站内搜索顺序的第一位，
+那家没版权/没收录时**照样兜底到其它三家** —— 此时会明确播报
+`⚠ 爱奇艺 没搜到「庆余年」，改用腾讯视频（指定站无版权/未收录时会退回其它三家）`，
+而不是让你从成功行的站名里猜（实测 `find_page_url(庆余年, prefer=爱奇艺)` 正是落到腾讯）。
+它当次就生效（`state["site"]` → `find_page_url(prefer=…)`），并且会一直沿用：之后 `s` 换源、
+再 `m` 换片都带着这个站，直到你改写它。无损云会话下写 `site X` 会被忽略并如实告知
+（它按片名直连、不分官方站），真要按站点找页得先 `s 4` 换到第三方源。
+菜单与一行式共用同一条落地路径（`_apply_source`），免得两种写法的边界条件不同步。
 
 用 `embed` 后端时，播放页右侧的选集栏也能点（桌面端鼠标移到播放器右缘展开，
 移动端点「☰ 选集」），与终端指令双向同步。
@@ -120,7 +168,7 @@ python -m video_vip --list
 
 `--list` 里的源分两类，**能不能只靠片名用**取决于这一分类：
 
-| 编号 | 源 | 工作方式 | 只给 `--title` 能用吗 | 能 `d` 下载吗 |
+| 编号 | 源 | 工作方式 | 只给 `--title` 能用吗 | 能下载吗（`d` / `--save`） |
 |---|---|---|---|---|
 | 0 | 无损云解析 | 按**片名**搜索（suggest → API 取 m3u8） | ✓ | ✓ 原生直链 |
 | 1 | LX解析 | 解析**一个具体视频页**（`源前缀 + 页面URL`） | ✓（自动找页） | ✓ |
@@ -136,9 +184,11 @@ python -m video_vip --list
 > `--list` 始终反映 `config.py` 里的当前列表。默认源按**名称**定位（`DEFAULT_SOURCE_NAME
 > = "LX解析"`）而非硬编码下标，列表增删导致编号漂移时仍指向它。
 
-「能 `d` 下载」= 该源已在 `jx_resolve._HOST_RESOLVERS` 登记，能把解析页抽成真·媒体直链
-（详见[第三方源抽流](#第三方源抽流jx_resolvepy)）。未登记的源按 `d` 会如实提示
-「尚未接入下载接口，请换无损云」，绝不臆造地址。
+「能下载」= 该源已在 `jx_resolve._HOST_RESOLVERS` 登记，能把解析页抽成真·媒体直链
+（详见[第三方源抽流](#第三方源抽流srcjx_resolvypy)）。未登记的源，无论按 `d` 还是
+`--save -s 该编号`，都**直接报错并列出可用编号**，绝不静默换成无损云、也不臆造地址。
+`--save` 不给 `-s` 时默认仍是无损云直连（与播放路径的默认源 LX解析 刻意不同，见
+[保存为 mp4](#保存为-mp4--save--d)）。
 
 第三方源拼的是 `source.url + 页面URL`（即 `showPlayerWindow` 里那一行），
 本身必须搭配视频页 URL。`--title` 只给片名时，CLI 会先自动补上「片名 → 官方视频页
@@ -152,14 +202,63 @@ $ python -m video_vip --title 庆余年 --episode 5 -s 2 --site 爱奇艺
   正在用「789解析」解析该页...
 ```
 
+指定的站**没命中**时不会硬停、也不会悄悄换家，而是先把落差讲出来（2026-10 实测输出，
+那次爱奇艺站内当天没返回「庆余年」的结果）：
+
+```
+$ python -m video_vip --title 庆余年 -s 2 --site 爱奇艺
+  正在 爱奇艺 站内搜索「庆余年」...
+  正在 腾讯视频 站内搜索「庆余年」...
+  ⚠ 爱奇艺 没搜到「庆余年」，改用腾讯视频（指定站无版权/未收录时会退回其它三家）
+  ✓ 按片名找到腾讯视频视频页：
+      https://v.qq.com/x/cover/rjae621myqca41h/i0032qxbi2v.html
+```
+
 ---
 
-## 片名 → 官方页 URL（`site_search.py`）
+## 片名 → 官方页 URL（`src/site_search.py`）
 
-为什么用 Bing `site:` 站内搜索而不是各家原生搜索接口：实测原生搜索在本机环境都不可用
-（腾讯视频 `vd.l.qq.com/proxyhttp` 要未公开的 buid；爱奇艺 suggest 子域连不上、主站是纯
-JS 壳；优酷 `so.youku.com` 返回 JS 跳转壳）。而 Bing 的 `site:` 站内搜索能稳定返回真实
-官方页 URL，且不依赖额外鉴权。
+站内搜索走**各家原生搜索接口**，不经第三方搜索引擎。旧版这里写的是「实测原生搜索在本
+机环境都不可用」（腾讯 `vd.l.qq.com/proxyhttp` 要未公开 buid、爱奇艺 suggest 连不上、
+优酷 `so.youku.com` 是 JS 壳），2026-10 复测该结论已过时：
+
+* 爱奇艺原生 JSON 接口 `search.video.iqiyi.com/o` 可直接通；
+* 优酷原生 `search.youku.com/api/search` 直接返回完整播放页 URL；
+* 腾讯真正的搜索接口是 `pbaccess...MultiTerminalSearch/MbSearch`（POST，**无需 buid**，
+  从 `v.qq.com/x/search` 的 JS bundle 逆向得到），当年试的 `proxyhttp` 才是要 buid 的那个。
+
+原生比 Bing 站内搜索更准：直接给官方页 URL 与整季元数据，不再有 `site:youku.com` 整体
+改回 `play.tudou.com` 镜像域、结果混入别家站或过期页的问题。**Bing 兜底已整条删除**
+（含 `_bing_search` / `_extract_urls` / `_decode_bing_href` / `_BING_FALLBACK_SITES`），
+芒果TV 改走下面的片库目录，四站一律只走自家接口。
+
+芒果TV 走的是**片库目录全量索引**，不是它的搜索接口：
+
+* `so.mgtv.com/so` 是纯 CSR（HTML 里剧名出现 0 次、`/b/` 链接 0 条），拿不到东西；
+* `mobileso.bz.mgtv.com/pc/search/v1` 只有 `src=intelmgtv` 免签，而它是**视频粒度的模糊
+  推荐源**：14 部剧实测只有 3 部给出可播正片，《难哄》给快乐大本营、《承欢记》给辟谣
+  新闻，正片 cid 常常根本不在结果里（《与凤行》`cid=626407` 搜索从不返回）；
+* 改用专辑粒度的权威目录 `pianku.api.mgtv.com/rider/list/pcweb/v3`（电视剧/综艺/电影
+  三频道，约 6100 条 / 170 页），首次使用时 8 并发翻页建进程内索引（约 3~5s），
+  此后片名→URL 是纯本地查表，命中即权威 `clipId + playPartId`。
+
+各家原生的**过滤要点**（都是实测踩出来的，缺一条就会给出坏链或错剧）：
+
+| 站点 | 命中页 | 原生接口必须处理的坑 |
+|---|---|---|
+| 腾讯视频 | `v.qq.com/x/cover/<cid>/<vid>.html` | 正片在 `areaBoxList`（MainNeed 主需求卡）而非 `normalList`；只认 `doc.dataType==2` + 站内 `enName=='qq'` 源 + **`videoInfo.year>0`**（PGC 自频道 year 恒为 0，实测《凡人修仙传》返回 127 集粉丝搬运号、《声生不息》返回奥运歌曲合集）；入口必须带 vid，光 `cid` 的 `/x/cover/<cid>.html` 第三方解析返回 None |
+| 爱奇艺 | `www.iqiyi.com/v_<vid>.html` | 该接口是**聚合搜索**，外站条目（`siteId=qq/youku`）的 `albumLink` 是 `so.iqiyi.com/links/…` 短链，跟随重定向跳回首页 —— 只认 `siteId=='iqiyi'`；`videoinfos[]` 只给前 20 集且 `itemLink` 同样是死短链，整季枚举仍走专辑页 HTML |
+| 优酷 | `v.youku.com/v_show/id_<vid>.html` | `leftButtonDTO.action.value` 直接就是播放页，但 `isYouku=1 且 hasYouku=0`（别家分销、优酷无片源）时它给的是**别家站点 URL**（实测搜「狂飙」给 `www.iqiyi.com/v_…`）—— 必须按域名过滤，并比对 `titleDTO.displayName` |
+| 芒果TV | `www.mgtv.com/b/<cid>/<vid>.html` | 片库目录：分页参数是 **`pn`**（前端自己发的 `pagedNo` 是假参数，传 2..40 拿到同一批 36 条）；`pageSize` 被服务端**硬锁 36**，调大无效，只能逐页翻；目录**不认片名**（keyword/q/name/title 等 12 个参数名全部被忽略），只能整库枚举建索引；`hitDocs[].playPartId` 就是可播 vid，`clipId` 是专辑 id —— 缺一个都拼不出可播页 |
+
+其余三家共用 `_rank_by_title` 做标题分级：归一化（去 `<em>`/`<B>` 高亮、空白、书名号/间隔号）
+后**完全相等 → 包含 → 二创/衍生垫底**，都不沾边的一律剔除。这一步是防错配的关键——实测
+优酷搜「以家人之名」时站内唯一可播的是**另一部剧**《以子之名》(`isYouku=1 hasYouku=1`)，
+只按域名过滤会把它当结果交出去；《庆余年第二季》站内也只有《〈庆余年第二季〉深度解读》。
+芒果不走这套模糊分级：候选来自全库目录，只认**归一化全等**外加「目录名以查询词起头」
+（声生不息 → 声生不息·港乐季），刻意不用反向包含与双向子串——否则「庆余年第二季」会匹上
+第一季、「狂飙」会匹上短视频专辑《…金币狂飙》。代价是它必须全库枚举；收益是**查不到即
+可信地判定芒果无此片**（实测《狂飙》《庆余年第二季》在芒果就是无版权），不必再靠外部引擎猜。
 
 覆盖**四家**官方主站，`--site` 可指定优先站、不指定则依次尝试：
 
@@ -167,11 +266,15 @@ JS 壳；优酷 `so.youku.com` 返回 JS 跳转壳）。而 Bing 的 `site:` 站
 |---|---|---|
 | 腾讯视频 | `v.qq.com/x/cover/<cid>/<vid>.html` | 纯 requests 打通 `pbaccess.getPage`（逆向 JS bundle 得到精确请求体：snake_case `page_params` + `page_bypass_params` + `vversion_name=8.5.96`），从返回 CardList 的 `pc_web_episode_list` 卡按集号取 vid；超 30 集走 tabs `page_context` 翻页 |
 | 爱奇艺 | `www.iqiyi.com/v_<vid>.html` | 桌面页被反爬挡，改抓**专辑页** `/a_<aid>.html`，其中静态内嵌整季 `/v_` 列表，按集号精确取 |
-| 优酷 | `v.youku.com/v_show/id_<vid>.html` | 桌面页被阿里 **x5sec 反爬盾**（返 1.5KB 空壳）；借道 `m.youku.com/video/id_<vid>.html` 不挡，从 `window.__INITIAL_DATA__` 内嵌 JSON 按 `stage` 取 vid 再拼回桌面 URL。Bing 对 `site:youku.com` 的结果 2026-10 起整体改返回 `play.tudou.com` 镜像域（同库同 vid），两域都认 |
-| 芒果TV | `www.mgtv.com/b/<cid>/<vid>.html` | 播放页是 Nuxt 空壳，选集靠官方分集接口 `pcweb.api.mgtv.com/episode/list` 异步拉 |
+| 优酷 | `v.youku.com/v_show/id_<vid>.html` | 桌面页被阿里 **x5sec 反爬盾**（返 1.5KB 空壳）；借道 `m.youku.com/video/id_<vid>.html` 不挡，从 `window.__INITIAL_DATA__` 内嵌 JSON 按 `stage` 取 vid 再拼回桌面 URL |
+| 芒果TV | `www.mgtv.com/b/<cid>/<vid>.html` | 播放页是 Nuxt 空壳，选集靠官方分集接口 `pcweb.api.mgtv.com/episode/list` 异步拉；只认 `isIntact=="1"` 的完整正片（同集常并列一条预览占位，预览页解析源解不动） |
 
 `SiteHit.episode_pinned` 如实标出是否**真的**定位到了那一集：枚举命中 → `True`；
 枚举失败（网络异常/超总集数）退回整季 cover 页 → `False`。**绝不因集数搜不到就返回 None。**
+
+> 已知缺口：芒果**综艺**的分集接口用**日期**而非「第N集」标注（实测 `t4=2022-04-17`、
+> `t1=期号`），`_mg_eps_from_data` 按「第N集」筛会整季为空 —— 页面本身可播（实测
+> 《声生不息》`isIntact=1` 正片），只是「共 N 集」列表当前列不出来。电视剧/电影不受影响。
 
 ---
 
@@ -236,7 +339,7 @@ iframe，**不能**判断播完）、`halt`（Python 侧退出，让页面停播
 
 ## 保存为 mp4（`--save` / `d`）
 
-`download.py` 复用 `prefetch.py` 的能力，分两步：
+`src/download.py` 复用 `src/prefetch.py` 的能力，分两步：
 
 1. **并发下载**：`parse_hls()` 解析清单 → `Prefetcher` 多线程拉分片到本地。
    单连接被限速在 ~1.2 Mbps，8 路并发能到 ~4.8 Mbps，整集 45 分钟约 400MB，
@@ -262,12 +365,25 @@ iframe，**不能**判断播完）、`halt`（Python 侧退出，让页面停播
 
 输出先写 `<名字>.part.mp4`，成功后再改名——中途失败不会留下一个看起来完整、实际损坏的 mp4。
 
-> `--save` 走的是无损云搜索取地址，`-s` 在这里不生效（会明确提示）。
-> **交互循环里的 `d` 才支持第三方源**：它先用 `jx_resolve` 把解析页抽成真·m3u8 再下。
+**取流有两条路**（`--save` 与交互循环里的 `d` 用的是同一套）：
+
+* **无损云直连**（`--save` 不给 `-s` 时的默认）：每集的 url 本身就是 m3u8 直链，直接下。
+* **第三方源抽流**（显式 `-s` 某个第三方源）：源给的是 `source.url + 官方页` 的**解析页**
+  （HTML、不是流），先由 `jx_resolve` 按「host → 抽流接口」映射抽出明文 m3u8（连带
+  它要求的 UA/Referer），再接到**同一条**下载通路上。`--save --title …` 会先站内搜索
+  定位官方页；`--save <URL>` 直接解析那一页，粘的是整季入口页或带了 `--episode` 时
+  先枚举整季定到单集页。
+
+没给 `-s` 时 `--save` 仍默认无损云，**刻意不跟播放路径共用默认源**（播放默认是 LX解析）：
+直连不依赖第三方接口是否存活、还能 `--variant` 选清晰度，对「下载」这件事更稳。
+
+> 未接入下载接口的源（目前只有「云解析」，`jx_resolve._HOST_RESOLVERS` 里没登记）会
+> **直接报错并列出可用编号**，绝不静默换成无损云、也不臆造地址。第三方接口今天能不能抽到
+> 流有波动（实测同一部剧不同日子只有部分源出链），失败时会提示重试或改 `-s 0`。
 
 ---
 
-## HLS 并发预取（`prefetch.py`）
+## HLS 并发预取（`src/prefetch.py`）
 
 为什么需要它：无损云的分片服务器对**单连接**限速，
 实测单连接只有 ~1.2 Mbps，而 720p 片源需要 ~1.4 Mbps——顺序取流必然追不上实时播放
@@ -294,10 +410,10 @@ iframe，**不能**判断播完）、`halt`（Python 侧退出，让页面停播
 
 ---
 
-## 第三方源抽流（`jx_resolve.py`）
+## 第三方源抽流（`src/jx_resolve.py`）
 
 第三方源每条每集链接是 `source.url + 官方页URL`，那本身是一个 **HTML 播放页**（不是流），
-直接喂给 `download.py` 的 `parse_hls` 会失败。真正出流的那步发生在浏览器 JS 里——
+直接喂给 `src/download.py` 的 `parse_hls` 会失败。真正出流的那步发生在浏览器 JS 里——
 本模块不跑浏览器，只把播放器页自己的请求照抄出来。
 
 `resolve()` 按「站点 host → 抽流函数」映射（`_HOST_RESOLVERS`）分发，每个 URL 只走匹配它
@@ -318,7 +434,7 @@ iframe，**不能**判断播完）、`halt`（Python 侧退出，让页面停播
 ### 冰豆（`bd.jx.cn`）
 
 三层跳转后进播放器页，取流核心是**两段 TinyGo 编译的 WASM**，纯 Python 跑不了，
-故随包带一段 Node 脚本 `bdjs/bd_run.js` 复现整条链：
+故随包带一段 Node 脚本 `src/bdjs/bd_run.js` 复现整条链：
 
 ```
 bd.jx.cn/?url=X  →  iframe jiexi.bot.cd/?url=X  →  iframe /jx/?url=X
@@ -355,9 +471,30 @@ POST {Api}/report-uuid/{uuid}     Content-Type: application/x-protobuf
    （`_sniff_media`），绝不信响应头/后缀。嗅探只发一次请求——冰豆 HLS 直链带
    `ckey`/`time` 票据，多打一次有耗票风险。
 
-`bdjs/` 目录自带 `go.wasm` + `wasm_exec.js`（离线可用），`global.min.js` 与
+`src/bdjs/` 目录自带 `go.wasm` + `wasm_exec.js`（离线可用），`global.min.js` 与
 `khd_play.js` 首次运行时抓取并缓存到同目录。**需要本机装有 `node`**；没有 node 时
 `_resolve_bd` 返回 `None`，调用方如实报错换源。
+
+---
+
+## 目录结构
+
+源码全部收在 `src/` 下，包根只留与源码无关的东西：
+
+```
+video_vip/
+├── README.md          本文档
+├── __init__.py        包入口：从 src/ 再导出公开 API（from video_vip import X 照旧可用）
+├── __main__.py        `python -m video_vip` 的薄壳，调 src/cli.py:main()
+├── .gitignore
+├── tests/             回归用例（仍在包根，不进 src）
+└── src/               全部源码
+    ├── config.py … cli.py
+    └── bdjs/          冰豆取流链的 Node 脚本 + WASM（随包，src/jx_resolve.py 按 __file__ 定位）
+```
+
+子模块的导入路径多一层：`from video_vip.src.title import …`（或包内相对导入 `from .title import …`
+不变）。顶层再导出的公开 API（`Config` / `Consumer` / `WsyzyDirect` / `start` 等）名字与以前一致。
 
 ---
 
@@ -365,24 +502,60 @@ POST {Api}/report-uuid/{uuid}     Content-Type: application/x-protobuf
 
 | 模块 | 职责 |
 |---|---|
-| `config.py` | 解析源列表（`VIDEO_PARSE_LIST`）/ 站点容器（`PLAYER_CONTAINERS`）/ `@include` 规则 |
-| `gm.py` | 持久化存储 / 打开链接 / 样式收集 |
-| `net.py` | HTTP 请求层（`req()`） |
-| `page.py` | `window` / `document` / `location` 的最小 DOM 兼容层 |
-| `util.py` | DOM 工具（`find_target_ele` / `remove_video` / `cleanup`）+ 页面会话 `PageSession` |
-| `title.py` | 片名识别与清洗（`wsyzy_clean_title` / `read_video_title` / `wait_stable_title`） |
-| `wsyzy.py` | 无损云直连（搜索 / 排序 / 详情 / 选集 / 播放 / 中止） |
-| `site_search.py` | 片名/集数 → 官方视频页 URL |
-| `player.py` | 播放页布局与样式构建 + 播放后端 |
-| `embedsrv.py` | embed 后端的本地 HTTP 服务与自有播放页 |
-| `ui.py` | 终端 UI（toast / 菜单 / 选集栏 / 进度条） |
-| `consumer.py` | 解析源菜单与播放调度（`Consumer` / `start`） |
-| `autonext.py` | 自动连播监视器 |
-| `prefetch.py` | HLS 并发预取引擎 |
-| `download.py` | 保存为 mp4 |
-| `jx_resolve.py` | 第三方解析页 → 真·媒体直链 |
-| `bdjs/bd_run.js` | 冰豆取流链的 Node 复现（含两段 WASM） |
-| `cli.py` | 命令行入口 |
+| `src/config.py` | 解析源列表（`VIDEO_PARSE_LIST`）/ 站点容器（`PLAYER_CONTAINERS`）/ `@include` 规则 |
+| `src/gm.py` | 持久化存储 / 打开链接 / 样式收集 |
+| `src/net.py` | HTTP 请求层（`req()`） |
+| `src/page.py` | `window` / `document` / `location` 的最小 DOM 兼容层 |
+| `src/util.py` | DOM 工具（`find_target_ele` / `remove_video` / `cleanup`）+ 页面会话 `PageSession` |
+| `src/title.py` | 片名识别与清洗（`wsyzy_clean_title` / `read_video_title` / `wait_stable_title`） |
+| `src/wsyzy.py` | 无损云直连（搜索 / 排序 / 详情 / 选集 / 播放 / 中止） |
+| `src/site_search.py` | 片名/集数 → 官方视频页 URL |
+| `src/player.py` | 播放页布局与样式构建 + 播放后端 |
+| `src/embedsrv.py` | embed 后端的本地 HTTP 服务与自有播放页 |
+| `src/ui.py` | 终端 UI（toast / 菜单 / 选集栏 / 进度条） |
+| `src/consumer.py` | 解析源菜单与播放调度（`Consumer` / `start`） |
+| `src/autonext.py` | 自动连播监视器 |
+| `src/prefetch.py` | HLS 并发预取引擎 |
+| `src/download.py` | 保存为 mp4 |
+| `src/jx_resolve.py` | 第三方解析页 → 真·媒体直链 |
+| `src/bdjs/bd_run.js` | 冰豆取流链的 Node 复现（含两段 WASM） |
+| `src/cli.py` | 命令行入口（`__main__.py` 在包根，只调它） |
+| `tests/` | 回归用例（7 个套件，见下「测试」；在包根，不进 `src/`） |
+
+---
+
+## 测试
+
+用例是**脚本式**的：模块顶层直接跑断言、末尾汇总 `PASS/FAIL`，两种跑法等价：
+
+```
+python tests/test_iqy_eps.py                 # 退出码即结果
+pytest tests -q                              # 走各文件的 test_no_failures()
+pytest tests/test_iqy_eps.py tests/test_yk_eps.py tests/test_cli_flow.py -q   # 只跑离线套件
+```
+
+| 套件 | 断言 | 联网 | 覆盖 |
+|---|---|---|---|
+| `test_iqy_eps.py` | 25 | 否（stub） | 爱奇艺 avlistinfo 优先 / 按 total 翻页 / contentType 过滤 / `/v_` 反推 albumId / 错 aid 退回单集 / HTML 兜底不退化 |
+| `test_yk_eps.py` | 23 | 否（stub） | 优酷只按「是否正片」过滤、**不按 stage 去重**、集号顺序重编、换集与枚举同口径 |
+| `test_sequel_rank.py` | 24 | 否 | 续集编号降级 + 候选排序（匹配度压过年份） |
+| `test_rank_title.py` | 14 | 否 | 标题归一化 / 二创识别 / 分级排序剔除 |
+| `test_cli_flow.py` | 68 | 否（stub） | `--save` 三条取流分派（第三方抽流 / 未接入源报错 / 不给 `-s` 仍走无损云）+ `d` 指令抽流、URL 优先 `--title` 忽略、`m` 换片名可指定官方站、`s` 换源保持当前集数、一行式命令（`m 片名 site 站` / `s 编号·源名·p弹窗` / 紧凑写法 / `save` 不被拆 / 参数大小写保护 / 认不出就拒绝）、`site` 兜底到别家时必须提示、输出配色与分块（颜色按首符号、起播+选集网格同块不空行、bg/独立面板留白、命令回显即分隔线） |
+| `test_native_search.py` | 69 | **是** | 四站原生搜索契约、`find_page_url` 端到端 |
+| `test_native_accuracy.py` | 33 | **是** | 片名→官方页命中率实测 |
+
+离线 5 套件合计 154 项，秒级跑完；联网 2 套件约 2 分钟，站点改版时会红——那是它该有的反应。
+
+`tests/conftest.py` 负责把仓库根加进 `sys.path`（`AI_coding` 是命名空间包，
+`from AI_coding.video_vip.src import ...` 需要仓库根在路径上）。各文件里另留了一行
+`sys.path.insert(0, str(Path(__file__).resolve().parents[3]))`：直接跑脚本时不加载
+conftest，那句是那种跑法唯一的引导来源，也因此不再写死盘符。
+
+stub 类套件（`test_iqy_eps` / `test_yk_eps`）会临时替换 `net.get_session`，跑完必须
+`_restore_net()` 还原——pytest 把 7 个套件导进同一个进程，不还原的话后面的联网用例
+会拿到 `FakeSession`（这个坑实测踩过，症状是 `test_native_search` 收集期 AttributeError）。
+`test_cli_flow` 同理：它换掉的是 `cli` 与 `jx_resolve` 上的真函数，脚本末尾统一
+`restore()` 还原，免得污染后面的套件。
 
 ---
 
@@ -419,6 +592,56 @@ POST {Api}/report-uuid/{uuid}     Content-Type: application/x-protobuf
 
 `rich` 默认会按终端宽度硬折行，中英混排 + emoji 时折行位置很难看。所有 `toast`
 输出走 `soft_wrap=True`，由文案自己控制换行（`\n`），不依赖终端宽度。
+
+### 输出配色与分块：颜色看符号，分块看来源
+
+一条命令跑下来，终端里同时躺着五种东西：搜索进度、命中结果、命令速查表、选集网格、
+后台线程插播（浏览器打开回执 / 自动连播 / 预取里程碑）。全挤在一起就分不出哪行属于
+哪件事，所以 `ui.py` 定了两条约定，**调用点一律不传样式**：
+
+| 维度 | 依据 | 取值 |
+|---|---|---|
+| 颜色 | 文案**首符号**（`_style_of`） | `✓` 绿 · `✗` 红 · `⚠` 黄 · `ℹ`/`↻`/`⬇` 与进度行蓝灰 |
+| 分块 | 消息**来源**（`toast(..., block=)`） | `flow` 主链路 · `bg` 后台线程插播 · `panel`/`sec:标题` 面板 |
+
+分块刻意**不按颜色断**：同一条工作流（搜索 → 命中 → 解析 → 起播 → 选集网格）里 ✓
+和进度行交替出现，按类别断块会把一件事切成五六行。所以判据是「这几行是不是在说同
+一件事」：
+
+* `flow` 内部连续打印**不空行**，起播状态和紧随其后的选集网格也同属这一块
+  （`render_list(..., block="flow")` → 只给 `section()` 传 `block` 就贴在当前块里，
+  不另开一块）；
+* 只有**换来源**才空一行：后台线程插播 `bg`（浏览器打开回执 / 自动连播 / 预取与下载
+  进度）、独立面板 `section()` / `start_block()`、banner `boot`；
+* 面板用 `─` 细横线框住，标题本身就是块名 —— 换标题必然留白；
+* **用户敲下的那行命令回显自带一条分隔线**，所以 `_input()` 读完一行就把块标记清零，
+  不在 `video_vip> 20` 下面再补一个空行。
+
+```
+  ██╗   ██╗██╗██████╗                 ← banner（boot）
+
+  正在 优酷 站内搜索「嫁金钗」...       ← 下面四行同属 flow，紧挨着不空行
+  ✓ 按片名找到优酷视频页：             ← ✓ 绿
+    https://v.youku.com/…
+  ✓ LX解析：浏览器（内嵌播放页…）
+
+  命令速查                             ← 换来源 → 空一行 + 细横线框
+  ────────────────────────────
+  …
+  ────────────────────────────
+
+  ✓ 播放页已在浏览器打开：…            ← 后台插播（bg）→ 再空一行
+
+video_vip> 20                          ← 命令回显本身就是分隔线
+  ✓ 正在播放 第20集                    ← 起播 + 选集网格是一组内容，不空行
+  《嫁金钗》选集（共 20 集，敲数字或 n/p 换集）:
+  ────────────────────────────
+     1   2   3 …  19 [20]
+  ────────────────────────────
+```
+
+`--quiet` / 测试用的 `SilentUi`、以及用例里的 `ScriptUi` 都保留了 `block` 关键字参数
+（收下即丢），所以给后台线程加块标记不会把静默模式跑崩。
 
 ---
 
@@ -496,6 +719,39 @@ POST {Api}/report-uuid/{uuid}     Content-Type: application/x-protobuf
   `url_supported` / `find_player_node` 均识别为对应官方站、七哥源拼接正确。凡人修仙传实测
   Bing 三家返回**字节完全相同**的通用结果（百科/B 站/起点），确认是 Bing 忽略 `site:` 的覆盖
   天花板、非网络或代码问题——平台正则过滤掉非官方结果后判为未命中、优雅退回无损云。
+  *（2026-10 补充：该天花板已随改用原生接口打破——凡人修仙传现由**优酷原生**命中并枚举整季
+  30 集；狂飙/水龙吟由**爱奇艺原生**命中。上面的 Bing 实测记录保留作历史。）*
+
+* **改走原生搜索（`_site_urls` → `_NATIVE_SEARCHERS`）**：爱奇艺 / 优酷 / 腾讯 / 芒果 四站
+  片名→官方页全部改由各家原生 JSON 接口完成，Bing 仅留作芒果兜底。端到端实测
+  （`tests/test_native_search.py` + `tests/test_native_accuracy.py`，117 项断言全绿）：
+  狂飙→爱奇艺 39 集连续、凡人修仙传→优酷 30 集连续、庆余年第二季 ep3→腾讯精确单集页且
+  整季 36 集、以家人之名 ep2→芒果 `pinned=True`、声生不息→腾讯《声生不息·港乐季》。
+  过程中修掉两个**只按域名过滤挡不住**的错配：优酷把另一部剧《以子之名》当站内结果给出
+  （`isYouku=1 hasYouku=1`）、腾讯 PGC 自频道给出 year=0 的粉丝搬运号（《凡人修仙传》127 集
+  解说号）——分别由 `_rank_by_title` 标题分级与 `year>0` 判据解决。
+  另修既有健壮性 bug：`_tencent_episode_url` 对电影/单片类裸 `json.loads(params.tabs)`
+  抛 `JSONDecodeError` 打断整条查找链，收敛到 `_tx_tabs()` 统一吞异常。
+  *（2026-10 再补充：其中「Bing 仅留作芒果兜底」已被下一条推翻并删除。）*
+
+* **芒果改走片库目录 + 删除 Bing 兜底**：推翻「芒果做不到精准匹配」的旧结论——错的不是判据，
+  是数据源。从零实测（14 轮探针）确认：`so.mgtv.com/so` 是纯 CSR（HTML 里剧名 0 次、`/b/`
+  链接 0 条）；`mobileso/pc/search/v1` 免签的 `src=intelmgtv` 是**视频粒度模糊推荐源**，
+  严格判据下 14 部只有 3 部给出可播正片，正片 cid 常常根本不在结果里（《与凤行》626407）；
+  而 `pianku.api.mgtv.com/rider/list/pcweb/v3` 是**专辑粒度权威目录**，分页参数是 `pn`
+  （前端自己发的 `pagedNo` 是假参数，据此曾误判「片库不可枚举」）、`pageSize` 硬锁 36、
+  `hitDocs[].playPartId` 即可播 vid（漏了它曾误判「cid 补不出可播页」）。故 `_mg_native_urls`
+  改为按 `pn` 枚举三频道（约 6100 条 / 170 页 / 8 并发 3~5s，进程内建一次）建
+  `{归一化片名: (cid, vid)}` 索引做全等匹配；`_BING_FALLBACK_SITES` 与
+  `_bing_search`/`_extract_urls`/`_decode_bing_href`/`_site_domain`、只喂 Bing 用的
+  `_SITE_PATTERNS` 正则整条删除，`_site_urls(query, site)` 签名去掉 `pattern` 形参。
+  端到端复测（`tests/test_native_search.py` 69 项 + `tests/test_native_accuracy.py` 33 项全绿）：
+  与凤行→`/b/626407/20772683.html`、以家人之名→333900（旧搜索给的是衍生篇 343554）、
+  玉簟秋→802659、我的人间烟火→509691 全部命中且播放页反查剧名一致；以家人之名 ep2 仍
+  `pinned=True`、整季 25 集 1..25 连续；乱查询四家全空 → `find_page_url` 优雅返回 None，
+  不再由 Bing 捞回花絮页充当结果。
+  遗留边界：① 目录只枚举了 `kind=a1`，「查不到 = 无版权」目前只对该档成立；② 综艺的
+  `episode/list` 用日期而非「第N集」标注，页面可播但整季列不出来（见上文已知缺口）。
 
 * **优酷集数枚举（`_youku_episode_url`）**：嫁金钗端到端实测，桌面 v.youku.com 被 x5sec 挡、
   但**移动 m.youku.com 不挡**且 `window.__INITIAL_DATA__` 内嵌 1–19 集 `(stage, vid)` 配对；
@@ -549,7 +805,7 @@ POST {Api}/report-uuid/{uuid}     Content-Type: application/x-protobuf
   接口抖动，`_resolve_lx` 未改动）；未登记的云解析 `is_supported()` 返回 False、
   `resolve()` 不发请求直接 None（如实报「不支持」）。
 
-* **冰豆取流链（`bdjs/bd_run.js`）**：端到端实测四种形态——
+* **冰豆取流链（`src/bdjs/bd_run.js`）**：端到端实测四种形态——
   腾讯真流（mp4，219MB，首字节 `ftypmp42`）、爱奇艺真流（hls，`#EXTM3U`，
   `parse_hls` 解出 19 分片）、以及两条挂在 byteimg `.jpg~tplv-…-image.image`
   伪装路径下的真 mp4（700MB / 479MB，Content-Type 分别谎报 `image/jpeg` 与
@@ -559,5 +815,74 @@ POST {Api}/report-uuid/{uuid}     Content-Type: application/x-protobuf
   且 `info` 里没有 `msg` 字段；真流响应必带 `msg`（`正常` / `数据正常`）。据此
   判据，5 条兜底全部被正确拒绝（`resolve()` 返回 None），未把宣传片当成正片。
   seed 公式（`field4=5` 用 `field4+field2+field3`、`field4=10` 用
-  `field4+meta1+meta2+field2+field3`）是运行时钩 `CryptoJS.MD5` 实测得到的，
+  `field4+meta1+meta2+field2+field3`）是运行时钩 `CryptoJS.MD5` 实测得到的，    
   不是猜的；两条分支各自解出真流即为交叉验证。
+
+* **`--save` 打通第三方源 / URL 优先 / 换源保集数（2026-10）**：四条行为改动。  
+  ① `--save` 不再只走无损云：显式 `-s` 第三方源时「视频页 → 解析页 → `jx_resolve` 抽
+  明文 m3u8 → 同一条下载通路」，`_run_save` 里 URL 与片名两条入口都支持，`--episode`
+  靠 `list_episode_pages` 枚举整季定集；未接入下载接口的源直接报错并列出可用编号。
+  真实链路验证：`--save --title 以家人之名 -e 2 -s 4`（麒麟）拿到
+  `png.ruyijx.com/m3u8/….m3u8` 并带正确 Referer；`--save <芒果入口页> -e 3 -s 4`
+  枚举整季后抽到**另一条**直链（确实是第3集）；不给 `-s` 的无损云路径回归正常
+  （46 集、第01集直链）。同一天 LX / 789 对同一条芒果页抽流返回 None —— 属第三方
+  接口自身波动，代码如实报「本次抽流失败，可重试或 -s 0」，不静默换源。
+  ② 模式二只认 URL：原先「URL + `--title`」会拿 title 走无损云片名搜索，导致 `-s`
+  指定的第三方源永远用不上，且页面里那一季被搜索结果替换（同名不同版本会播错片）；
+  现在统一落到 `_play_page_url`，`--title` 只在页面识别不出剧名时当显示名兜底
+  （`drama` 取值顺序：`fetch_show_name` → 页面标题 → `--title`）。
+  ③ 交互 `m` 换片名时会追问官方站（`_pick_site(ui, keep=…)`，回车沿用上次选择），
+  答案写进 `state["site"]` 供 `find_page_url(prefer=…)`；无损云会话不问（不分官方站）。
+  ④ 交互 `s` 换源**保持在播的那一集**：改用「当前集的官方页」（选集栏那条 url 去掉
+  `source.url` 前缀）重解析，并把 `season_url` 一路传进 `interactive`；`relaunch` 增加
+  `episode` 参数，换源/弹窗路径都带上当前集号，换片名仍传 0（回第 1 集）。定不到那一集
+  时如实播报「现在在第 N 集」，不谎报。四条改动已固化为离线用例
+  `tests/test_cli_flow.py`（`ui._input` 脚本喂入 + 网络函数打桩，当时 23 项断言全过），
+  真机浏览器会话未逐步回放。
+
+* **一行式交互命令（2026-10）**：`m` / `s` 允许把后续追问折叠进同一行
+  （`m 嫁金钗`、`m 嫁金钗 site 爱奇艺`、`s 4`、`s 麒麟`、`s p4`），只敲单个字母时
+  老写法（逐项追问 / 源菜单）完全不变；紧凑写法 `m嫁金钗` / `s4` 也认。
+  新增 `_SITES_CN`（四家标准写法，`--site` 的 choices、`_pick_site` 的追问、
+  `m … site X` 三处共用，简称先展开再比全等）、`_KNOWN_CMDS`（整词命令表，保证
+  `save` 不被拆成 `s` + `ave`）与五个纯函数 `_match_site` / `_split_site_arg` /
+  `_match_source` / `_resolve_source_arg` / `_apply_source`。命令切分改成
+  「首 token 是命令、其余原样是参数」，**参数不再参与 `lower()`**（否则英文片名被
+  削小写、站内搜索字面一变召回就变）；非 `m`/`s` 的命令带参数一律拒绝并提示。
+  `site X` 在无损云会话下会被忽略并如实告知。菜单与一行式共用 `_apply_source`，
+  两条写法不会再各走各的边界条件。ui 的帮助表补了常驻的一行式语法提示。
+  已在 `tests/test_cli_flow.py` 第 [5] 段固化 25 项（纯函数 12 + 端到端流程 13，
+  套件合计 48 项全过）；真机终端未逐条回放。
+
+* **`site` 的「优先 vs 限定」（2026-10）**：回答「`m 片名 site 爱奇艺` 会生效吗」时
+  实测出的语义落差。`find_page_url(prefer=…)` 做的是 `sites.insert(0, prefer)` +
+  搜不到 `continue`，即**优先站**而非硬限定；庆余年 `prefer=爱奇艺` 真实返回
+  `v.qq.com/x/cover/…`（爱奇艺站内那次没出结果），落到别家却**毫无提示**，只有成功行
+  的站名泄露真相 —— 而 `--site` 的 help 当时写的是「限定」。改法：搜索实现改名
+  `_scan_page_url`（内部一行没动），`find_page_url` 变薄壳，命中站≠指定站时补一条
+  note（CLI 三处调用点都已把 note 接到 `ui.toast`，无需各自改）；`--site` help 与
+  README 措辞改成「优先…未命中会退回其它三家并提示」。无损云会话下 `site` 仍按原样
+  **忽略并提示**（它按片名直连、不分官方站），不自动改解析源。
+  第 [6] 段固化 5 项（prefer 透传 / 落到别家提示 / 命中不多嘴 / 没指定不提 /
+  全空不谎报），套件 53 项全过；端到端复跑 `find_page_url(庆余年, prefer=爱奇艺)`
+  经真实 `Ui.toast` 通道确认提示确实显示且不折行错乱。
+  踩坑一条：拿裸 `print` 当 on_note 探针会在 GBK 控制台炸 `⚠`（`UnicodeEncodeError`），
+  走 `ui.toast`（rich + soft_wrap）才与真实链路一致 —— 探针也得用生产通道。
+
+* **终端输出的配色与分块（2026-10）**：真机跑 `--title 嫁金钗` 时，banner、三家搜索进度、
+  命中行、解析回执、命令速查、选集网格、浏览器打开回执全挤在一坨，分不出块。约定定为
+  **颜色看首符号、分块看来源**：`_style_of` 按 `✓/✗/⚠/ℹ↻⬇` 选色（cli.py 近百处 `ui.toast`
+  一处不改就各归各的色），`toast(..., block=)` 只让**换来源**时留白 —— 主链路 `flow` 内部
+  连续不空行，后台线程插播（浏览器回执 / 自动连播 / 预取与下载进度）标 `bg`（共 5 处），
+  独立面板走 `section()` / `start_block()` 并上下各加一条 `─`。
+  中途推翻过两版：① 「按符号类别断块」—— 离线重放真渲染后发现 ✓ 与进度行交替时每条
+  之间都插了空行，一条工作流被切成六行，比原来的平铺更难读；② 把选集网格当面板 ——
+  真机敲 `20` 换集后出来的是「命令回显 / 空行 / 正在播放 / 空行 / 选集网格」，一组内容
+  被劈成三截。于是 `section()` 加了 `block` 参数（传了就贴在当前块里只打标题），
+  `render_list` 默认挂 `flow`；`_input()` 读完一行把块标记清零，让命令回显自己当分隔线。
+  第 [7] 段固化 15 项（三色分配 / flow 不空行 / 起播+网格同块 / bg 留白 / `section`
+  换标题留白 / 面板带细横线 / 首条输出前不空行 / `_input` 后不补空行 / `SilentUi`
+  签名兼容），套件 68 项全过；
+  假 console 直接接住 `print(文本, 样式)`，所以断言不依赖 rich 装没装。
+  另一个坑：拿 `Console(file=StringIO(), force_terminal=True)` 探 ANSI 时色码数恒为 0，
+  必须显式给 `color_system="truecolor"` —— rich 对着内存流不做终端色彩探测。

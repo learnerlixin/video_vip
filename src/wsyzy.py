@@ -25,7 +25,7 @@ from .config import Config
 from .net import WsyzyError
 from .page import Window
 from .player import PLAYER, FrameLayout, PlayerBackend, Rect, build_player_frame_layout
-from .title import wait_stable_title, wsyzy_clean_title
+from .title import is_numbered_sequel, wait_stable_title, wsyzy_clean_title
 from .ui import Ui
 from .util import (
     FindEleTimeout,
@@ -164,7 +164,11 @@ class WsyzyDirect:
         """`rankCandidates(list, title)`：精确 > 前缀 > 包含 > 反向包含 > 其他。
 
         单字片名不做反向包含，避免播错片。
-        打分写回 `_score` 字段，后续「首候选是否精确命中」的判定要用。
+        **带编号的续集降级**：搜「年会不能停」时「年会不能停2：水到渠成」按
+        startswith 也能拿 3 分，与本片同档；用户没点名续集就不该抢位，压到 2 分
+        （仍留在「包含」档，想播还能选到）。
+        打分写回 `_score` / `_sequel` 字段，后续「首候选是否精确命中」与选择面板
+        排序都要用。
         """
 
         def score(x: Dict[str, Any]) -> int:
@@ -172,7 +176,7 @@ class WsyzyDirect:
             if name == title:
                 return 4
             if name.startswith(title):
-                return 3
+                return 2 if is_numbered_sequel(title, name) else 3
             if title in name:
                 return 2
             if len(title) >= 2 and name and name in title:
@@ -182,6 +186,7 @@ class WsyzyDirect:
         # sorted 是稳定排序，同分候选保持原有顺序
         ordered = sorted(items, key=lambda x: -score(x))
         for x in ordered:
+            x["_sequel"] = is_numbered_sequel(title, x.get("name") or "")
             x["_score"] = score(x)
         return ordered
 

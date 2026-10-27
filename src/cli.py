@@ -1,18 +1,24 @@
 """cli.py —— 命令行入口。
 
     python -m video_vip                        # 不带参数：进程序后交互式选片名/URL/解析源
-    python -m video_vip <视频页URL>            # 完整流程：识别片名 → 搜索 → 播放
+    python -m video_vip <视频页URL>            # 注入该页 → 选解析源 → 起播（只认 URL）
     python -m video_vip --title 庆余年          # 跳过页面，直接按片名搜索播放
     python -m video_vip <URL> --no-auto        # 只出解析源菜单，不自动播放
     python -m video_vip --list                 # 列出所有解析源
     python -m video_vip --title 庆余年 -s 1 --site 优酷   # 站内搜索优酷页交给第三方源
+    python -m video_vip --title 庆余年 -e 5 --save        # 无损云直连，只下载不播放
+    python -m video_vip --title 庆余年 -e 5 -s 4 --save   # 第三方源抽流下载（jx_resolve）
 
 播放起来之后进入交互循环：
     n / p        下一集 / 上一集
     <数字>       跳到第 N 集
     l            列出全部集数
-    m            重新选择影片（换片名，沿用当前解析源）
-    s            切换解析源（沿用当前片名）
+    m [片名]     重新选择影片（换片名，沿用当前解析源，第三方源时可换官方站）
+                 一行式：`m 嫁金钗` 直接换片、`m 片名 site 爱奇艺` 指定优先站；
+                 只敲 `m` 才逐项追问片名与站点
+    s [编号]     切换解析源（同一影片、同一集数，只换解析接口）
+                 一行式：`s 4`／`s 麒麟`（源名可模糊匹配）／`s p4`（弹窗播放）；
+                 只敲 `s` 才出源菜单
     r            重新加载当前集（reloadCurrentPlayer）
     a            开/关自动解析
     x            开/关自动连播
@@ -52,6 +58,19 @@ BANNER = r"""
 
 # 看起来像 URL 的最低要求：有 scheme，或首段里有域名点号（v.qq.com/x/...）
 _URLISH_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://|^[^/\s]+\.[^/\s]+")
+
+# 四家官方站的标准写法（与 site_search._SITES 同集合）：`--site` 的 choices、交互里
+# 的追问、一行式 `m 片名 site X` 都归一到这几个字面上，`find_page_url(prefer=…)`
+# 按全等比较，所以简称（腾讯/芒果）必须先展开成它。
+_SITES_CN = ("腾讯视频", "爱奇艺", "优酷", "芒果TV")
+
+# 交互循环里认识的整词命令（数字跳集不在此列）。有两个用途：给未知命令兜提示，
+# 以及判断 `m嫁金钗` 这种紧凑写法该不该拆 —— `save` 必须以整词命中，
+# 否则会被当成 `s` + `ave` 换到一个不存在的解析源上。
+_KNOWN_CMDS = frozenset({
+    "q", "quit", "exit", "h", "l", "u", "a", "x", "d", "dl", "save", "r",
+    "n", "next", "p", "prev", "m", "s",
+})
 
 
 def looks_like_url(text: str) -> bool:
@@ -116,21 +135,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("url", nargs="?", help="视频页 URL")
-    parser.add_argument("-t", "--title", help="跳过页面抓取，直接用这个片名搜索")
+    parser.add_argument("-t", "--title",
+                        help="跳过页面抓取，直接用这个片名搜索（同时给了视频页 URL 时"
+                             "以 URL 为准，--title 被忽略）")
     parser.add_argument("-e", "--episode", type=int, default=0, help="指定播放第几集（从 1 开始）")
     parser.add_argument(
         "-s", "--source", type=int, default=None,
         help="指定解析源编号（见 --list），不指定则用默认源（当前 = LX解析）。"
              "第三方源解析的是具体视频页：带视频页 URL 时直接拼解析；"
-             "只给 --title 时会先站内搜索腾讯/爱奇艺/优酷定位官方页再喂给它，"
-             "搜不到自动回退无损云（-s 0）",
+             "只给 --title 时会先站内搜索腾讯/爱奇艺/优酷/芒果TV定位官方页再喂给它，"
+             "搜不到自动回退无损云（-s 0）。"
+             "配合 --save 时用第三方源下载：解析页 → 抽明文 m3u8 → 并发分片封装",
     )
     parser.add_argument(
         "--site",
-        choices=["腾讯视频", "爱奇艺", "优酷", "芒果TV"],
+        choices=list(_SITES_CN),
         default=None,
-        help="配合 --title + 第三方源：限定去哪家官方站找视频页 URL。"
-             "不指定则依次尝试（腾讯→爱奇艺→优酷→芒果TV）",
+        help="配合 --title + 第三方源：优先去哪家官方站找视频页 URL。"
+             "不指定则依次尝试（腾讯→爱奇艺→优酷→芒果TV）；"
+             "指定的站没搜到会自动退回其它三家并提示",
     )
     parser.add_argument(
         "-p",
@@ -164,7 +187,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--save",
         action="store_true",
-        help="不播放，直接把视频保存为 mp4（并发下载分片 + ffmpeg 封装，需要本机有 ffmpeg）",
+        help="不播放，直接把视频保存为 mp4（并发下载分片 + ffmpeg 封装，需要本机有 ffmpeg）。"
+             "默认走无损云直连；显式 -s 第三方源时走「解析页抽流」，"
+             "未接入下载接口的源会直接报错",
     )
     parser.add_argument(
         "-o",
@@ -195,20 +220,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def print_sources(ui: Ui, cfg: Optional[Config] = None) -> None:
     """把 videoParseList 按两组（内嵌 / 弹窗）打印出来。"""
-    ui._print("[内嵌播放]", style="bold color(117)")
+    ui.section("[内嵌播放]")
     for index, item in enumerate(VIDEO_PARSE_LIST):
         if item.wsyzy or "1" in item.type:
             tag = "（屏蔽欧美、欧洲线路）" if item.wsyzy else ""
             ui._print(f"  {index}  {item.name}{tag}", style="color(110)")
-    ui._print("[弹窗播放不带选集]", style="bold color(117)")
+    ui.section("[弹窗播放不带选集]")
     for index, item in enumerate(VIDEO_PARSE_LIST):
         if not item.wsyzy and "3" in item.type:
             ui._print(f"  {index}  {item.name}  {item.url}", style="color(110)")
     if cfg is not None:
-        ui._print("[播放后端]", style="bold color(117)")
+        ui.section("[播放后端]")
         for key, backend in available_backends(cfg).items():
             ui._print(f"  {key:8s} {backend.describe()}", style="color(110)")
-    ui._print("[缓存目录]", style="bold color(117)")
+    ui.section("[缓存目录]")
     ui._print(f"  {CACHE_ROOT}", style="color(110)")
     ui._print("    embed\\player.html        内嵌播放页（file:// 兜底时用）", style="dim")
     ui._print("    hls.min.js               hls.js 本地缓存（embed 播放页离线兜底）", style="dim")
@@ -263,7 +288,8 @@ def _make_backend(cfg: Config, prefer: str, ui: Optional[Ui] = None, **prefetch_
     （原地刷新）—— 否则上千片会刷上千行，终端根本没法看。
     """
     if ui is not None and prefetch_kwargs.get("on_progress") is None:
-        prefetch_kwargs["on_progress"] = lambda text: ui.toast(text, False)
+        # 预取进度来自后台线程，会在用户敲命令时插播 → 标成 bg 块，与主线输出隔开
+        prefetch_kwargs["on_progress"] = lambda text: ui.toast(text, False, block="bg")
     if ui is not None and prefetch_kwargs.get("make_progress") is None:
         prefetch_kwargs["make_progress"] = ui.progress
     if prefer and prefer != "auto":
@@ -493,7 +519,7 @@ def _save_one(url: str, title: str, ep_name: str, ui: Ui, opts: Dict[str, Any],
             workers=opts.get("workers", 8),
             variant=opts.get("variant", "highest"),
             stop_event=stop,
-            on_progress=lambda text: ui.toast(text, False),
+            on_progress=lambda text: ui.toast(text, False, block="bg"),
             make_progress=ui.progress,
             headers=headers,
         )
@@ -523,6 +549,45 @@ def _save_one(url: str, title: str, ep_name: str, ui: Ui, opts: Dict[str, Any],
     return True
 
 
+def _downloadable_source_names() -> str:
+    """已接入「抽流下载」的第三方源（编号 名称），报错时给出可直接抄的编号。"""
+    return "、".join(f"{i} {src.name}" for i, src in enumerate(VIDEO_PARSE_LIST)
+                     if not src.wsyzy and jx_resolve.is_supported(src.url))
+
+
+def _source_of_parse_page(parse_page: str) -> Optional[int]:
+    """解析页 URL 是哪个源拼出来的（前缀命中）；认不出返回 None。"""
+    for i, src in enumerate(VIDEO_PARSE_LIST):
+        if src.url and parse_page.startswith(src.url):
+            return i
+    return None
+
+
+def _thirdparty_stream(parse_page: str, ui: Ui, name: str) -> Optional[tuple]:
+    """第三方解析页 → (明文 m3u8 直链, 请求头)；抽不出返回 None（原因已打印）。
+
+    解析页本身是 HTML，直接喂下载器会失败；jx_resolve 按「host → 抽流接口」映射把
+    播放器自己发的那些请求照抄出来，拿到真·m3u8。**未接入的源** `is_supported` 就是
+    False（不发任何请求），这里如实列出可用编号，绝不臆造地址。
+    """
+    if not jx_resolve.is_supported(parse_page):
+        usable = _downloadable_source_names()
+        ui.toast(f"✗ 「{name}」未接入下载接口，可改用：\n"
+                 f"    {usable}\n"
+                 f"    或无损云直连：-s 0", False)
+        print(f"video_vip: 「{name}」未接入下载接口（可用：{usable}）", file=sys.stderr)
+        return None
+    info = jx_resolve.resolve(parse_page)
+    if info is None:
+        ui.toast(f"✗ 「{name}」本次抽流失败（接口无响应/线路变更），\n"
+                 f"    可重试，或改用无损云直连：-s 0", False)
+        print(f"video_vip: 「{name}」抽流失败", file=sys.stderr)
+        return None
+    link = info.m3u8 if len(info.m3u8) <= 90 else info.m3u8[:87] + "..."
+    ui.toast(f"⬇ 第三方源已抽到 m3u8 直链，转下载：{link}", False)
+    return info.m3u8, info.headers()
+
+
 def _do_save(result: Any, ui: Ui, opts: Dict[str, Any]) -> bool:
     """保存交互循环里当前这一集（`d` 指令）。
 
@@ -538,24 +603,47 @@ def _do_save(result: Any, ui: Ui, opts: Dict[str, Any]) -> bool:
     title = result.hit.get("name", "") if result.hit else ""
     headers = None
     if not is_media_url(url):                       # 第三方解析页：抽流出真 m3u8
-        if not jx_resolve.is_supported(url):        # 未接入下载的源：直接报错
-            ui.toast("✗ 该第三方源尚未接入下载接口（不支持），请用 `m` 换无损云（-s 0）再 d",
-                     False)
+        idx = _source_of_parse_page(url)
+        name = VIDEO_PARSE_LIST[idx].name if idx is not None else "该第三方源"
+        got = _thirdparty_stream(url, ui, name)
+        if got is None:
             return False
-        info = jx_resolve.resolve(url)              # 已支持：抽流，失败多为接口抖动
-        if info is None:
-            ui.toast("✗ 该源本次抽流失败（接口无响应/换源），可重试或 `m` 换无损云（-s 0）再 d",
-                     False)
-            return False
-        link = info.m3u8 if len(info.m3u8) <= 90 else info.m3u8[:87] + "..."
-        ui.toast(f"⬇ 第三方源已抽到 m3u8 直链，转下载：{link}", False)
-        url = info.m3u8
-        headers = info.headers()
+        url, headers = got
     return _save_one(url, title, ep.get("name", ""), ui, opts, headers=headers)
 
 
-def _run_save(args: argparse.Namespace, ui: Ui) -> int:
-    """--save：解析出目标地址后直接保存，不播放、不进交互循环。"""
+def _save_pick_episode(url: str, episode: int, ui: Ui) -> str:
+    """--save <视频页URL> 时把 URL 定到**具体单集页**（第三方源解析不了整季入口页）。
+
+    两种情况要枚举整季：①粘的是入口页（爱奇艺 /a_、腾讯 cid-only cover，实测第三方
+    源解析返回 None）；②给了 --episode。枚举不到就如实退回原 URL，绝不假装切了集。
+    """
+    if not (_looks_like_collection_page(url) or episode > 0):
+        return url
+    concrete = [pu for _n, pu in (list_episode_pages(url) or [])]
+    if not concrete:
+        if episode > 0:
+            ui.toast(f"⚠ 该站枚举不出整季，第{episode}集定不了：\n"
+                     f"    按你给的页面原样下载", False)
+        return url
+    if episode > 0:
+        idx = min(episode - 1, len(concrete) - 1)
+        if episode > len(concrete):
+            ui.toast(f"⚠ 这一季只枚举到 {len(concrete)} 集，改下第 {idx + 1} 集", False)
+        return concrete[idx]
+    return concrete[0]
+
+
+def _run_save(args: argparse.Namespace, ui: Ui, source: Optional[int] = None) -> int:
+    """--save：解析出目标地址后直接保存，不播放、不进交互循环。
+
+    取流有两条路，看 `source`（用户显式给的 -s 编号）：
+      · 无损云 —— 片名 → 搜索 → 每集本身就是 m3u8 直链；
+      · 第三方源 —— 视频页 → `source.url + 页面` 解析页 → jx_resolve 抽明文 m3u8，
+        接到和无损云**同一条**下载通路（并发分片 + ffmpeg 封装）。
+    没给 -s 时仍走无损云，**刻意不跟播放路径共用默认源**：直连不依赖第三方接口是否
+    存活、还能 --variant 选清晰度，对「下载」这件事更稳；想用第三方源下载得显式 -s。
+    """
     opts = _save_opts(args)
 
     def fail(msg: str) -> int:
@@ -569,22 +657,43 @@ def _run_save(args: argparse.Namespace, ui: Ui) -> int:
         ok = _save_one(args.url, args.title or "", "", ui, opts)
         return 0 if ok else 2
 
-    # 2) 给的是片名（可能还带视频页 URL）→ 走无损云搜索拿选集
-    if args.title:
-        result = play_by_title(
-            args.title,
-            episode=args.episode,
-            ui=ui,
-            backend=None,
-            is_mobile=args.mobile,
-            no_play=True,
-        )
-        if result is None:
+    ep_name = f"第{args.episode}集" if args.episode > 0 else ""
+
+    # 2) 显式指定了第三方解析源：视频页 → 解析页 → 抽流 → 下载
+    if source is not None and _source_needs_page_url(source):
+        src = VIDEO_PARSE_LIST[source]
+        page = args.url or ""
+        drama = args.title or ""
+        if page:
+            page = _save_pick_episode(page, args.episode, ui)
+            drama = drama or fetch_show_name(page)
+        else:
+            if not args.title:
+                return fail("✗ --save 用第三方源需要片名（--title）或视频页 URL")
+            hit = find_page_url(args.title, episode=args.episode, prefer=args.site,
+                                on_note=lambda t: ui.toast(t, False))
+            if hit is None:
+                return fail(f"✗ 腾讯/爱奇艺/优酷/芒果TV 都没搜到「{args.title}」的视频页，\n"
+                            f"    改用无损云下载：--title {args.title} -s 0")
+            if hit.episode > 0 and not hit.episode_pinned:
+                ui.toast(f"⚠ 未能定位第{hit.episode}集（{hit.site} 枚举异常或集数超出范围）：\n"
+                         f"    将下载整季页枚举出的那一集", False)
+            page, drama = hit.url, args.title
+            ui.toast(f"✓ 找到{hit.label()}视频页：\n    {page}", False)
+        if not url_supported(page):
+            ui.toast(f"⚠ {page} 不在 @include 列表内，仍尝试抽流")
+        ui.toast(f"正在用「{src.name}」抽流...", False)
+        got = _thirdparty_stream(src.url + page, ui, src.name)
+        if got is None:
             return 2
-        ok = _do_save(result, ui, opts)
+        ok = _save_one(got[0], drama, ep_name, ui, opts, headers=got[1])
         return 0 if ok else 2
 
-    # 3) 只给了视频页 URL → 从页面读出片名，再走无损云搜索（不起播）
+    # 3) 无损云直连：这条只能按片名搜。同时给了 URL 时**以 URL 为准**（与播放路径同
+    #    规则：URL 优先、--title 忽略）—— 先试官方数据源 fetch_show_name（桌面页是反爬
+    #    空壳、解析页 <title> 又是源名，读标题不可靠），拿不到才退回读页面标题，
+    #    两者都失败才用 --title 兜底：总比直接失败强。
+    name = args.title or ""
     if args.url:
         ui.set_status("读取页面片名...")
         page = PageSession(args.url)
@@ -592,34 +701,40 @@ def _run_save(args: argparse.Namespace, ui: Ui) -> int:
             page.load()
         except Exception as exc:
             return fail(f"✗ 页面加载失败（{type(exc).__name__}）：{exc}")
-        try:
-            page_title = wait_stable_title(page)
-        except KeyboardInterrupt:
-            ui.toast("✗ 已取消")
-            return 1
-        except Exception:
-            page_title = ""
-            ui.toast("⚠ 读取片名失败，将按空片名处理")
-        if not page_title or len(page_title) < 2:
-            return fail("✗ 无法从页面识别片名，请用 --title 指定")
+        name = fetch_show_name(args.url) or ""
+        if not name:
+            try:
+                name = wait_stable_title(page) or ""
+            except KeyboardInterrupt:
+                ui.toast("✗ 已取消")
+                return 1
+            except Exception:
+                name = ""
+        if name:
+            if args.title and name != args.title:
+                ui.toast(f"ℹ 已按 URL 识别片名「{name}」，忽略 --title「{args.title}」")
+            else:
+                ui.toast(f"识别到片名「{name}」")
+        else:
+            name = args.title or ""
+            if not name:
+                return fail("✗ 无法从页面识别片名，请用 --title 指定")
+            ui.toast(f"⚠ 页面识别不出片名，改用 --title「{name}」")
+    if not name:
+        return fail("✗ --save 需要指定片名（--title）或视频地址")
 
-        ui.toast(f"识别到片名「{page_title}」")
-        result = play_by_title(
-            page_title,
-            episode=args.episode,
-            ui=ui,
-            backend=None,
-            is_mobile=args.mobile,
-            no_play=True,
-        )
-        if result is None:
-            return 2
-        ok = _do_save(result, ui, opts)
-        return 0 if ok else 2
-
-    ui.toast("✗ --save 需要指定片名（--title）或视频地址")
-    print("video_vip: --save 需要指定片名（--title）或视频地址", file=sys.stderr)
-    return 1
+    result = play_by_title(
+        name,
+        episode=args.episode,
+        ui=ui,
+        backend=None,
+        is_mobile=args.mobile,
+        no_play=True,
+    )
+    if result is None:
+        return 2
+    ok = _do_save(result, ui, opts)
+    return 0 if ok else 2
 
 
 def interactive(
@@ -630,15 +745,26 @@ def interactive(
     save_opts: Optional[Dict[str, Any]] = None,
     auto_next: bool = False,
     site: Optional[str] = None,
+    season_url: Optional[str] = None,
 ) -> None:
     """播放后的命令循环（换集 / 换源 / 换片 / 保存 / 连播）。
 
     `auto_next=True` 时一集播完自动切下一集；循环里随时可用 `x` 开/关。
 
-    `m`（换片名）与 `s`（换解析源）走**统一的 relaunch**：记住当前片名与当前源，
-    任一方改动都用「新片名 + 新源」重新起播、回到第 1 集。无损云按片名直连搜索；
-    第三方源解析的是具体视频页，于是借道 `find_page_url`（站内搜腾讯/爱奇艺/优酷）
-    先定位该片名的官方页再喂给所选源，找不到就如实回退无损云。`site` 是限定优先站。
+    `s`（换解析源）与 `m`（换片名）的区别是**要不要保持集数**：
+      * `s` 是「同一影片换个解析接口」，复用当前这一集的官方页重解析、集号保持不变；
+      * `m` 是换一部片子，理应从第 1 集开始。
+    两条命令都可以写成一行（`m 嫁金钗 site 爱奇艺`、`s 4` / `s 麒麟` / `s p4`），
+    解析在 `_split_site_arg` / `_resolve_source_arg`；只敲单个字母才逐项追问。
+    参数认不出时一律**拒绝执行**并列出可用值 —— 把「哔哩哔哩」当片名硬搜、
+    或把一个模糊源名硬切过去，都比原地不动更糟。
+    两者最终都落到 `_search_ws` / `_search_page`：无损云按片名直连搜索；第三方源解析
+    的是具体视频页，于是借道 `find_page_url`（站内搜腾讯/爱奇艺/优酷/芒果TV）先定位
+    官方页再喂给所选源，找不到就如实回退无损云。
+    `site` 是**优先站、不是硬限定**：那家没搜到会自动退回其它三家（find_page_url 会
+    如实提示「改用 腾讯视频」）；无损云会话不分官方站，写了会被忽略。`m` 换片名时可
+    临时改它（见 `m` 分支）。`season_url` 是可枚举整季的那一页（入口页），换源时拿它
+    补全「共 N 集」。
     """
     save_opts = dict(save_opts or {})
     ui.render_help()
@@ -733,7 +859,7 @@ def interactive(
         backend=result.backend if result is not None else None,
         get_state=get_state,
         advance=switch_to,
-        notify=lambda text: ui.toast(text, False),
+        notify=lambda text: ui.toast(text, False, block="bg"),
         enabled=auto_next,
     )
     monitor.start()
@@ -741,31 +867,53 @@ def interactive(
         ui.toast(monitor.status_text(), False)
 
     # ── 统一的「换片名 / 换源」重起点（relaunch）────────────────────────────
-    # 记住当前片名与当前源：m 改片名、s 改源都调 relaunch，用「新片名 + 当前源」
-    # 重新起播并回到第 1 集。这样 m 不会再把第三方源重置回无损云。
+    # 记住当前片名 / 当前源 / 优先官方站 / 整季入口页：m 改片名（可顺带改站）、s 改源
+    # 都以它为准。这样 m 不会把第三方源重置回无损云，s 也不会丢掉当前在播的那一集。
     state = {
         "src": (consumer.selected_index if consumer is not None
                 and consumer.selected_index is not None else 0),
         "title": (result.hit.get("name", "") if result is not None else ""),
+        "site": site,
+        "season": season_url or "",
     }
 
-    def _search_ws(title: str) -> Optional[Any]:
-        """无损云按片名起播，复用当前后端（不新建，避免动到 embed 本地服务）。"""
+    def _cur_index() -> int:
+        """当前在播第几集（0-based）。"""
+        with switch_lock:
+            return result.index if result is not None else 0
+
+    def _episode_no() -> int:
+        """当前集号（1-based，传给 find_page_url / play_by_title；第1集用 0=默认）。"""
+        cur = _cur_index()
+        return cur + 1 if cur > 0 else 0
+
+    def _search_ws(title: str, episode: int = 0) -> Optional[Any]:
+        """无损云按片名起播，复用当前后端（不新建，避免动到 embed 本地服务）。
+
+        `episode` 是 1-based 集号（0=第 1 集）：换源时带上它才能保持集数不变。
+        """
         with switch_lock:
             backend = result.backend if result is not None else None
-        return play_by_title(title, episode=0, ui=ui,
+        return play_by_title(title, episode=episode, ui=ui,
                              backend=backend, is_mobile=cfg.isMobile)
 
-    def _search_page(title: str, src: int) -> Optional[Any]:
+    def _search_page(title: str, src: int, episode: int = 0) -> Optional[Any]:
         """第三方源：片名 → 官方页 URL（站内搜索）→ start 解析该页并选 src。
 
+        `episode`（1-based，0=第1集）交给 `find_page_url` 去定位那一集的单集页。
+        起播后 `result.index` 由 `_enrich_thirdparty_episodes` 按「实际解析的是哪一页」
+        对齐，所以调用方**不必**再手动改集号。
         返回 (new_consumer, new_result)；页面找不到或解析失败返回 None（调用方回退）。
         """
-        hit = find_page_url(title, episode=0, prefer=site,
+        hit = find_page_url(title, episode=episode, prefer=state.get("site"),
                             on_note=lambda t: ui.toast(t, False))
         if hit is None:
             return None
         ui.toast(f"✓ 找到{hit.label()}视频页：\n    {hit.url}", False)
+        if hit.episode > 0 and not hit.episode_pinned:
+            # 枚举失败退回整季页 —— 如实说，绝不报「已定位第N集」
+            ui.toast(f"⚠ {hit.site} 未能定位第{hit.episode}集（枚举异常或超出总集数）：\n"
+                     f"    已打开整季页，请在选集栏手动点第{hit.episode}集", False)
         with switch_lock:
             backend = result.backend if result is not None else None
         new_consumer = start(hit.url, ui=ui, backend=backend,
@@ -780,10 +928,15 @@ def interactive(
         # 第三方源只解析得出这一页（1 集）——补成整季，换片名后终端仍能 n/p/l 换集
         _enrich_thirdparty_episodes(new_consumer.last_result, new_consumer,
                                     hit.url, hit.season_url or hit.url, ui, drama=title)
+        state["season"] = hit.season_url or hit.url
         return new_consumer, new_consumer.last_result
 
-    def relaunch(title: str, src: int) -> bool:
-        """用 (title, src) 重新起播并回到第 1 集；成功返回 True。
+    def relaunch(title: str, src: int, episode: int = 0) -> bool:
+        """用 (title, src) 重新起播；`episode` 是 1-based 集号（0=第 1 集）。
+
+        `m`（换片名）传 0 —— 换一部片子理应从第 1 集开始；`s`（换源）走到这里时传
+        当前集号 —— 换接口不该改看在看第几集。集号由 `_search_ws`/`_search_page`
+        内部对齐，这里**不再**强行回第 1 集。
 
         consumer 生命周期：换片名/换源都重建一份，旧的 shutdown(stop_player=False)
         —— 保留后端进程/本地服务复用，只是不再管它。无损云会话则 consumer=None。
@@ -803,15 +956,15 @@ def interactive(
         new_result: Optional[Any] = None
         applied_src = src
         if not _source_needs_page_url(src):
-            new_result = _search_ws(title)          # 无损云：按片名直连
+            new_result = _search_ws(title, episode)    # 无损云：按片名直连
         else:
-            got = _search_page(title, src)
+            got = _search_page(title, src, episode)
             if got is not None:
                 consumer, new_result = got
             else:
                 ui.toast(f"⚠ 没搜到「{title}」的可解析视频页，"
                          f"{VIDEO_PARSE_LIST[src].name} 用不上；已回退无损云。", False)
-                new_result = _search_ws(title)
+                new_result = _search_ws(title, episode)
                 applied_src = 0
         if new_result is None:
             ui.toast(f"✗ 「{title}」未能起播，保持原影片不变")
@@ -822,11 +975,12 @@ def interactive(
         result = new_result
         state["title"] = title
         state["src"] = applied_src
+        # 集号是各路径内部对齐的（无损云按 idx、第三方按「解析的是哪一页」）；
+        # 定不到用户要的那一集就如实说，绝不说「已定位第N集」。
+        if episode and (result.index or 0) + 1 != episode:
+            ui.toast(f"⚠ 没能定位到第{episode}集（枚举异常或超出总集数）：\n"
+                     f"    现在停在第{(result.index or 0) + 1}集", False)
         monitor.set_backend(result.backend)
-        try:
-            result.index = 0                         # 回到第 1 集
-        except Exception:
-            pass
         ui.ep_bar(result.episodes, result.index,
                   lambda e: result.backend.play(e["url"], title=result.hit.get("name", "")),
                   title=result.title)
@@ -834,16 +988,32 @@ def interactive(
         return True
 
     def switch_source(src: int) -> bool:
-        """s 换源：**同一影片换个解析接口**——复用当前官方页 URL，直接用新源重解析，
-        绝不按片名重搜（换源本就该是同一页；重搜依赖剧名准确，而第三方源的 hit.name
-        在优酷移动页偶发取空时会退回解析页标题=源名，于是会去搜「M3U8解析」而失败）。
+        """s 换源：**同一影片换个解析接口**，并且**保持在播的那一集**。
 
-        只有两种情况退回按片名重跑 relaunch：①当前是无损云会话（没有页面 URL 可复用）；
-        ②目标是**无损云**（它本就按片名搜索、没有可复用的解析页）。"""
+        第三方源 → 第三方源：直接拿「当前这一集的官方页」重解析，而不是会话最初那一页
+        —— 否则用户看到第 5 集换个源就被拽回第 1 集。当前集官方页 = 选集栏里那条
+        `源前缀 + 官方页` 去掉前缀；枚举不出整季（只有 1 集）时退回会话最初的页。
+
+        另两种情况退回按片名重跑 relaunch，并照样带上当前集号：①当前没有页面会话
+        （无损云直连）；②目标是无损云（它按片名搜索、没有解析页可复用）。
+        绝不因为「换了源」就重搜第三方页：重搜依赖剧名准确，而第三方源的 hit.name 在
+        优酷移动页偶发取空时会退回解析页标题=源名，于是会去搜「M3U8解析」而失败。"""
         nonlocal result, consumer
         page_url = (consumer.page.url if consumer is not None else "") or ""
-        if not page_url or not _source_needs_page_url(src):
-            return relaunch(state["title"], src)
+        episode = _episode_no()
+        if (not page_url or not _source_needs_page_url(src)
+                or not _source_needs_page_url(state["src"])):
+            return relaunch(state["title"], src, episode)
+        # 当前集的官方页：认不出前缀（枚举不出整季/源已变）就退回会话最初的页
+        target_page = page_url
+        cur = _cur_index()
+        prefix = VIDEO_PARSE_LIST[state["src"]].url or ""
+        with switch_lock:
+            eps = list(result.episodes) if result is not None else []
+        if 0 <= cur < len(eps) and prefix:
+            u = eps[cur].get("url") or ""
+            if u.startswith(prefix) and u[len(prefix):]:
+                target_page = u[len(prefix):]
         # 关掉旧会话（shutdown(stop_player=False) 保留后端进程/本地服务复用）
         if consumer is not None:
             try:
@@ -853,8 +1023,8 @@ def interactive(
             consumer = None
         with switch_lock:
             backend = result.backend if result is not None else None
-        new_consumer = start(page_url, ui=ui, backend=backend,
-                             page=PageSession(page_url), auto=True, source=src)
+        new_consumer = start(target_page, ui=ui, backend=backend,
+                             page=PageSession(target_page), auto=True, source=src)
         if new_consumer is None or new_consumer.last_result is None:
             if new_consumer is not None:
                 try:
@@ -863,25 +1033,55 @@ def interactive(
                     pass
             ui.toast(f"✗ 没能用「{VIDEO_PARSE_LIST[src].name}」解析当前影片，保持不变")
             return False
-        # 补成整季选集，剧名沿用当前 state["title"]（复用同一页，不换片）
+        # 补成整季选集，剧名沿用当前 state["title"]（复用同一页，不换片）；
+        # 整季入口页优先用已知的那个（--title 路径/上次枚举拿到的），退回会话原页。
+        season = state.get("season") or page_url
         _enrich_thirdparty_episodes(new_consumer.last_result, new_consumer,
-                                     page_url, page_url, ui, drama=state["title"])
+                                     target_page, season, ui, drama=state["title"])
         consumer = new_consumer
         result = new_consumer.last_result
         state["src"] = src
+        state["season"] = season
         with switch_lock:
             probe_gen[0] += 1                        # 作废旧地址的时长探测
         monitor.set_backend(result.backend)
-        try:
-            result.index = 0                         # 回到第 1 集
-        except Exception:
-            pass
         ui.ep_bar(result.episodes, result.index,
                   lambda e: result.backend.play(e["url"], title=result.hit.get("name", "")),
                   title=result.title)
         probe_duration_async(result.episode()["url"])
-        ui.toast(f"✓ 已用「{VIDEO_PARSE_LIST[src].name}」解析同一影片", False)
+        # 集号是 _enrich 按「解析的是哪一页」对齐的：定不到用户在看的那一集就如实说
+        now = _cur_index()
+        if episode and now + 1 != episode:
+            ui.toast(f"✓ 已用「{VIDEO_PARSE_LIST[src].name}」解析同一影片\n"
+                     f"    ⚠ 没能定位到第{episode}集（该站枚举不出整季），"
+                     f"现在在第{now + 1}集", False)
+        else:
+            ui.toast(f"✓ 已用「{VIDEO_PARSE_LIST[src].name}」解析同一影片"
+                     f"（保持第 {now + 1} 集）", False)
+        monitor.note_manual_switch()
         return True
+
+    def _apply_source(index: int, popup: bool) -> None:
+        """把一次「选源」落地：内嵌走 switch_source（保持当前集），弹窗走 pick_popup。
+
+        交互菜单（`s` 后挑编号）与一行式（`s 4` / `s p4`）共用这条路径，
+        免得两种写法各自的边界条件不同步。
+        """
+        if popup and VIDEO_PARSE_LIST[index].wsyzy:
+            ui.toast("✗ 无损云按片名搜索，没有可弹窗的解析页；\n"
+                     "    要内嵌播它就写：s 0")
+            return
+        if not popup:
+            switch_source(index)
+            return
+        # 弹窗播放不带选集：需要一个视频页。无损云会话没有页，先内嵌
+        # 重跑建立页面会话，再在这个页上弹窗。带上当前集号，别掉回第1集。
+        if consumer is None:
+            relaunch(state["title"], index, _episode_no())
+            if consumer is None:
+                ui.toast("✗ 这部片没能建立页面会话（回退成无损云了），弹窗播放用不上")
+                return
+        _dispatch(consumer, ui, index, popup=True)
 
     def _source_menu() -> Optional[Any]:
         """列出全部解析源，返回 (index, popup)；q 返回 None。不依赖 consumer。
@@ -961,7 +1161,8 @@ def interactive(
                 try:
                     ep = result.episodes[idx]
                     ui.toast("✓ 播放页选集："
-                             f"{ep.get('name') or ('第' + str(idx + 1) + '集')}", False)
+                             f"{ep.get('name') or ('第' + str(idx + 1) + '集')}",
+                             False, block="bg")
                 except Exception:
                     pass
 
@@ -985,10 +1186,11 @@ def interactive(
             return                  # 用户已经退出了，别再打一行
         if opened:
             page_url = getattr(backend, "page_url", None)
-            ui.toast(f"✓ 播放页已在浏览器打开{('：' + page_url) if page_url else ''}", False)
+            ui.toast(f"✓ 播放页已在浏览器打开{('：' + page_url) if page_url else ''}",
+                     False, block="bg")
         else:
             ui.toast("⚠ 浏览器没能打开播放页（没有默认浏览器？）。"
-                     "可改用 --player mpv / ffplay 在本地播放", False)
+                     "可改用 --player mpv / ffplay 在本地播放", False, block="bg")
 
     threading.Thread(target=embed_open_watch, name="embed-open", daemon=True).start()
 
@@ -1009,7 +1211,22 @@ def interactive(
                 break
             if not raw:
                 continue
-            cmd = raw.lower()
+            # 首 token 是命令，其余原样是参数：**参数不参与 lower()**。
+            # 原先整行 lower 再比较，一行式 `m Osiris 之泪` 会把片名削成小写，
+            # 而片名正是站内搜索要用的关键词，字面变了召回就跟着变。
+            head, _, tail = raw.partition(" ")
+            cmd = head.lower()
+            arg = tail.strip()
+            if (cmd not in _KNOWN_CMDS and cmd[:1] in ("m", "s") and cmd[1:]):
+                # 紧凑写法 `m嫁金钗` / `s4`：中文输入法下不打空格是很自然的动作，
+                # 不该逼用户重来。`save` 这类整词命令已在 _KNOWN_CMDS 里，不会被拆。
+                arg = (cmd[1:] + (" " + arg if arg else "")).strip()
+                cmd = cmd[:1]
+            if arg and cmd not in ("m", "s"):
+                # 只有 m / s 折叠了参数；别把 `n 3` 当成 `n` 静默执行前半句
+                ui.toast(f"✗ 「{cmd}」不带参数（多出来的 {arg!r} 也没被执行）：\n"
+                         f"    能写成一行的是 m 片名 [site 官方站] 与 s 编号/源名")
+                continue
 
             if cmd in ("q", "quit", "exit"):
                 break
@@ -1030,6 +1247,7 @@ def interactive(
 
             if cmd == "u" and result is not None:
                 ep = result.episode()
+                ui.start_block()      # 直链信息是一块独立输出，别贴在上一块下面
                 ui._print(f"  片名：{result.hit.get('name')}")
                 ui._print(f"  当前：{ep.get('name') or ep['url']}")
                 ui._print(f"  m3u8：{ep['url']}")
@@ -1076,30 +1294,47 @@ def interactive(
                 continue
 
             if cmd == "s" and result is not None:
+                if arg:
+                    # 一行式：`s 4` / `s 麒麟` / `s p4`（弹窗）。认不出就拒绝，不弹菜单
+                    popup, index, err = _resolve_source_arg(arg)
+                    if index is None:
+                        ui.toast(err)
+                        continue
+                    _apply_source(index, popup)
+                    continue
                 sel = _source_menu()
                 if sel is None:
                     continue
                 index, popup = sel
-                if popup:
-                    # 弹窗播放不带选集：需要一个视频页。无损云会话没有页，先内嵌
-                    # 重跑建立页面会话，再在这个页上弹窗。
-                    if consumer is None:
-                        relaunch(state["title"], index)
-                        if consumer is None:
-                            continue            # 回退成无损云了，没有可弹窗的页
-                    _dispatch(consumer, ui, index, popup=True)
-                    continue
-                switch_source(index)
+                _apply_source(index, popup)
                 continue
 
             if cmd == "m" and result is not None:
-                ui.toast("重新选择影片：请输入新的片名")
-                try:
-                    new_title = ui._input("片名 > ").strip()
-                except (EOFError, KeyboardInterrupt):
+                # 一行式：`m 片名` 直接换片、`m 片名 site 爱奇艺` 顺带换官方站；
+                # 只敲 `m` 才逐项追问（老写法不变）。参数认不出时一律拒绝执行，
+                # 绝不"当成片名"硬搜 —— 搜错片比不动更糟。
+                new_title, site_sel, err = _split_site_arg(arg)
+                if err:
+                    ui.toast(err)
                     continue
-                if new_title:
-                    relaunch(new_title, state["src"])   # 沿用当前源，不回退无损云
+                if site_sel:
+                    if _source_needs_page_url(state["src"]):
+                        state["site"] = site_sel
+                    else:
+                        ui.toast(f"ℹ 无损云按片名直连、不分官方站："
+                                 f"site「{site_sel}」已忽略", False)
+                if not new_title:
+                    ui.toast("重新选择影片：请输入新的片名")
+                    try:
+                        new_title = ui._input("片名 > ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        continue
+                    if not new_title:
+                        continue
+                    # 这一行里没写 site 才追问（写了就以它为准）
+                    if _source_needs_page_url(state["src"]) and not site_sel:
+                        state["site"] = _pick_site(ui, keep=state.get("site"))
+                relaunch(new_title, state["src"])   # 沿用当前源，不回退无损云
                 continue
 
             if result is None:
@@ -1256,20 +1491,23 @@ def _play_page_url(
             return 1
 
     result = consumer.last_result
-    # 真实剧名：--title 关键词优先。第三方源解析的是页面本身——桌面官方页是反爬空壳、
-    # 解析页 <title> 又是源名（如「M3U8解析」），据此读到的标题不是剧名；故先打官方
-    # 数据源 fetch_show_name（优酷移动页 showName）拿真名，取不到才退回读页面标题。
-    # 无损云自带剧名，无需检测。
-    drama = args.title or ""
+    # 剧名以**页面**为准（模式二「只认 URL」原则的延伸）：--title 不再抢在前面，
+    # 只在页面实在认不出时当显示名兜底。第三方源解析的是页面本身 —— 桌面官方页是
+    # 反爬空壳、解析页 <title> 又是源名（如「M3U8解析」），所以先走官方数据源
+    # fetch_show_name（优酷移动页 showName 等），取不到才退回读页面标题。
+    # 无损云自带剧名（hit.name），无需检测，也就不会被 --title 覆盖。
     _is_thirdparty = (consumer.selected_index is not None
                       and _source_needs_page_url(consumer.selected_index))
-    if not drama and _is_thirdparty:
+    drama = ""
+    if _is_thirdparty:
         drama = fetch_show_name(url)
         if not drama:
             try:
                 drama = wait_stable_title(consumer.page, max_wait=3000) or ""
             except Exception:
                 drama = ""
+    if not drama:
+        drama = args.title or ""
     # 第三方内嵌源只解析得出当前这一页（1 集）——据官方整季页补成「共 N 集」，
     # 让 n/p / 数字 / l 在第三方源下也能换集（换集=加载另一条解析页）。
     _enrich_thirdparty_episodes(result, consumer, url, season_url or url, ui, drama=drama)
@@ -1288,7 +1526,8 @@ def _play_page_url(
 
     if not args.no_interact:
         interactive(consumer, result, ui, consumer.cfg, save_opts=_save_opts(args),
-                    auto_next=args.auto_next, site=args.site)
+                    auto_next=args.auto_next, site=args.site,
+                    season_url=season_url or url)
 
     consumer.shutdown(stop_player=not args.no_interact)
     return 0
@@ -1327,23 +1566,130 @@ def _pick_source_index(ui: Ui) -> int:
         ui.toast("无效编号，请重试")
 
 
-def _pick_site(ui: Ui) -> Optional[str]:
-    """第三方源 + 片名时，问优先去哪家官方站找页面；回车=三家依次尝试。"""
+def _match_site(text: str) -> Optional[str]:
+    """官方站名容错匹配 → 标准站名（认不出返回 None）。
+
+    `_pick_site` 的交互输入与 `m 片名 site X` 的一行式参数**共用这一份判据**，
+    否则两处各写一条匹配规则迟早口径漂移。简称要展开：
+    腾讯→腾讯视频、芒果→芒果TV。
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    for name in _SITES_CN:
+        if t == name or t in name or name.startswith(t):
+            return name
+    return None
+
+
+def _split_site_arg(arg: str) -> tuple:
+    """`m` 的一行式参数 `片名 [site 官方站]` → (片名, 标准站名, 错误文案)。
+
+    `site` 一律写在**末尾**，切分时取最后一个 ` site ` 段：片名里真含 "site"
+    也能靠最后一段识别（`m A site B site 爱奇艺` → 片名「A site B」+ 爱奇艺）。
+    连续空格会被压成一个（`"庆余年  第二季"` → `"庆余年 第二季"`），对搜索是
+    等价甚至更好的写法，故不做特殊保护。
+
+    返回的站名可能是 `None`：①压根没写 site（正常，沿用上次选择）；②写了但认不出
+    （错误文案非空，调用方必须拒绝执行，不能假装生效）。
+    """
+    parts = arg.split()
+    if "site" not in parts:
+        return " ".join(parts).strip(), None, ""
+    i = len(parts) - 1 - parts[::-1].index("site")      # 最后一个 site
+    title = " ".join(parts[:i]).strip()
+    tail = parts[i + 1:]
+    if not tail:
+        return title, None, ("✗ site 后面要跟一家官方站：\n"
+                             "    腾讯 / 爱奇艺 / 优酷 / 芒果")
+    if len(tail) > 1:
+        return title, None, (f"✗ site 只能跟一家（收到「{' '.join(tail)}」）：\n"
+                             f"    多出来的那几个字是片名的一部分吗？"
+                             f"那就把它们写在 site 之前")
+    hit = _match_site(tail[0])
+    if hit is None:
+        return title, None, (f"✗ 认不出官方站「{tail[0]}」，可用：\n"
+                             f"    腾讯 / 爱奇艺 / 优酷 / 芒果")
+    return title, hit, ""
+
+
+def _match_source(text: str) -> List[int]:
+    """`s` 的一行式参数 → 命中的解析源编号列表（可能 0 / 1 / 多个）。
+
+    纯数字当编号用；否则按源名匹配，**前缀命中唯一就直接采用**（`麒麟`→4、
+    `M3U8`→7 而非 8），前缀不唯一或没命中再退回包含匹配，交给调用方报歧义
+    （`解析` 会命中全部 9 家，这种输入猜哪一家都不诚实）。
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+    if t.isdigit():
+        return [int(t)] if 0 <= int(t) < len(VIDEO_PARSE_LIST) else []
+    low = t.lower()
+    pref = [i for i, s in enumerate(VIDEO_PARSE_LIST) if s.name.lower().startswith(low)]
+    if len(pref) == 1:
+        return pref
+    return pref or [i for i, s in enumerate(VIDEO_PARSE_LIST) if low in s.name.lower()]
+
+
+def _resolve_source_arg(arg: str) -> tuple:
+    """`s` 的一行式参数 → (是否弹窗, 编号, 错误文案)；编号为 None 表示没解析成。
+
+    弹窗写法沿用 `_source_menu` 里的 `p+编号`（`s p4` / `s p 4`）。只有编号能弹窗
+    —— 源名先匹配再判弹窗会让 `s playm3u8` 那种名字里的 p 被当成前缀。
+    """
+    t = arg.strip()
+    popup = False
+    head = t
+    if t[:1].lower() == "p" and t[1:].lstrip().isdigit():
+        popup, head = True, t[1:].lstrip()
+    elif t.split()[:1] == ["p"] and len(t.split()) == 2 and t.split()[1].isdigit():
+        popup, head = True, t.split()[1]
+    hits = _match_source(head)
+    if not hits:
+        if head.isdigit():
+            return popup, None, (f"✗ 没有编号为 {head} 的解析源"
+                                 f"（可用编号 0-{len(VIDEO_PARSE_LIST) - 1}，见 --list）")
+        return popup, None, (f"✗ 认不出解析源「{arg}」，可用：\n    "
+                             + _all_source_names())
+    if len(hits) > 1:
+        return popup, None, (f"⚠ 「{head}」匹配到多个解析源：\n    "
+                             + "、".join(f"{i} {VIDEO_PARSE_LIST[i].name}" for i in hits)
+                             + "\n    请改用编号，如：s "
+                             + ("p" if popup else "") + str(hits[0]))
+    return popup, hits[0], ""
+
+
+def _all_source_names() -> str:
+    return "、".join(f"{i} {s.name}" for i, s in enumerate(VIDEO_PARSE_LIST))
+
+
+def _pick_site(ui: Ui, keep: Optional[str] = None) -> Optional[str]:
+    """第三方源 + 片名时，问优先去哪家官方站找页面。
+
+    `keep` 是上一次的选择（交互循环里 `m` 换片名会传进来）：给了它就**回车沿用**，
+    没给则回车=四家依次尝试（腾讯→爱奇艺→优酷→芒果TV）。
+    """
     ui._print("  到哪家官方站找该片的视频页？", style="bold color(117)")
-    ui._print("    回车=三家依次尝试（腾讯→爱奇艺→优酷）；或输入 腾讯 / 爱奇艺 / 优酷",
-              style="dim")
+    if keep:
+        ui._print(f"    回车=沿用上次的 {keep}；\n"
+                  f"    或输入 腾讯 / 爱奇艺 / 优酷 / 芒果 换一家", style="dim")
+    else:
+        ui._print("    回车=四家依次尝试（腾讯→爱奇艺→优酷→芒果TV）；\n"
+                  "    或输入 腾讯 / 爱奇艺 / 优酷 / 芒果",
+                  style="dim")
     while True:
         try:
             raw = ui._input("  官方站 > ").strip()
         except (EOFError, KeyboardInterrupt):
             ui._print("")
-            return None
+            return keep
         if not raw or raw.lower() in ("q", "quit", "exit"):
-            return None
-        for name in ("腾讯视频", "爱奇艺", "优酷"):
-            if raw == name or raw in name or name.startswith(raw):
-                return name
-        ui.toast("请输入 腾讯 / 爱奇艺 / 优酷，或回车用默认")
+            return keep               # 没改变主意：沿用上次（从未选过则四家依次）
+        hit = _match_site(raw)
+        if hit is not None:
+            return hit
+        ui.toast("请输入 腾讯 / 爱奇艺 / 优酷 / 芒果，或回车用默认")
 
 
 def bootstrap(ui: Ui, args: argparse.Namespace) -> bool:
@@ -1420,6 +1766,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not args.quiet:
         ui._print(BANNER, style="color(117)")
+        ui.start_block("boot")      # banner 自成一块：下面第一条进度前会空一行
 
     # 不带来源参数不再直接打帮助退出，而是进程序后交互式选播放方式/片名或URL/解析源
     if not args.url and not args.title:
@@ -1450,21 +1797,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ── 模式零：--save 只保存不播放 ─────────────────────────────────────────
     if args.save:
-        # --save 走的是无损云搜索取地址，第三方解析源给不出可下载的裸流，
-        # 所以 -s 在这里没有意义 —— 说清楚，别让用户以为指定生效了。
+        # 取流两条路：默认无损云直连；显式 -s 第三方源则「视频页 → 解析页抽明文 m3u8」。
+        # 后者依赖 jx_resolve 已逆通的接口，没接入的源会如实报错（列出可用编号），
+        # 不会静默换成无损云 —— 用户明确选了源，就不能假装它生效了。
         if source is not None and _source_needs_page_url(source):
             ui.toast(
-                f"⚠ --save 只支持无损云直连取流，\n"
-                f"    「{VIDEO_PARSE_LIST[source].name}」不会生效\n"
-                f"    （第三方解析源给不出可下载的裸流）"
+                f"ℹ --save 走「{VIDEO_PARSE_LIST[source].name}」：\n"
+                f"    视频页 → 解析页抽明文 m3u8 → 并发分片下载\n"
+                f"    （该源没接入下载接口时会直接报错，可 -s 0 走无损云直连）"
             )
-        return _run_save(args, ui)
+        return _run_save(args, ui, source)
 
     # ── 模式一：只给片名 ────────────────────────────────────────────────────
     if not args.url:
         # 只给片名时，第三方解析源本来用不了：它们解析的是「一个具体视频页」
         # （`source.url + 页面URL`），而这里没有页面 URL。但可以先「片名 → 官方页
-        # URL」（site_search：Bing 站内搜索腾讯/爱奇艺/优酷），再交给完整注入流程，
+        # URL」（site_search：四家各自的原生接口/片库目录），再交给完整注入流程，
         # 于是 `--title … -s 2` 也能走第三方源。搜不到才退回无损云并说明原因。
         # 未显式 -s 时用默认源（config.DEFAULT_SOURCE_INDEX，当前 = LX解析），
         # 与交互菜单/auto 解析的默认保持一致；默认是无损云(0) 时下面判据为假，直接片名搜索。
@@ -1479,7 +1827,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     f"✓ 按片名找到{hit.label()}视频页：\n    {hit.url}", False
                 )
                 if hit.episode > 0 and not hit.episode_pinned:
-                    # 三家均可枚举精确到集；走到这里说明枚举失败（网络异常/超总集数），
+                    # 四家均可枚举精确到集；走到这里说明枚举失败（网络异常/超总集数），
                     # 只能打开整季页 —— 如实告知，绝不说「已定位第N集」。
                     ui.toast(
                         f"⚠ 未能定位第{hit.episode}集（{hit.site} 枚举异常或集数超出范围）：\n"
@@ -1503,7 +1851,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             ui.toast(
                 f"⚠ 没搜到「{args.title}」的{wanted}可用视频页：\n"
                 f"    第三方解析源解析的是具体视频页，需要页面地址，\n"
-                f"    已尝试站内搜索腾讯/爱奇艺/优酷，均未命中。\n"
+                f"    已尝试站内搜索腾讯/爱奇艺/优酷/芒果TV，均未命中。\n"
                 f"    可直接带视频页 URL 使用：\n"
                 f"      python -m video_vip <视频页URL> -s {eff}\n"
                 f"    或指定官方站：\n"
@@ -1529,35 +1877,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     # ── 模式二：给视频页 URL（完整解析流程）─────────────────────────────
+    # 给了 URL 就**只认 URL**：解析、起播、换集全都以那个页面为准，--title 忽略。
+    # 旧逻辑是「URL + title → 拿 title 走无损云搜索」，两个毛病：①-s 指定的第三方
+    # 源永远用不上；②页面里那一季的实际内容被片名搜索结果替换掉，同名不同版本
+    # （剧场版/TV版）就会播错片。剧名改由页面决定（见 _play_page_url 里的取值顺序）。
     if args.title:
-        # URL + 片名：页面只用来判定当前集数与站点容器，片名以用户输入为准。
-        # 注意这条路径走的仍是无损云搜索（play_by_title），所以 -s 指定的
-        # 第三方源同样用不上 —— 明确告知，别让用户以为生效了。
-        if source is not None and _source_needs_page_url(source):
-            ui.toast(
-                f"⚠ 已指定 --title，走的是无损云按片名搜索，\n"
-                f"    「{VIDEO_PARSE_LIST[source].name}」不会生效。\n"
-                f"    想用该解析源请去掉 --title：\n"
-                f"      python -m video_vip {args.url} -s {source}"
-            )
-        if not url_supported(args.url):
-            ui.toast(f"⚠ {args.url} 不在 @include 列表内，仍尝试解析")
-        cfg = Config(url=args.url, is_mobile=args.mobile)
-        backend = _make_backend(cfg, args.player, ui=ui, **_prefetch_kwargs(args))
-        page = PageSession(args.url)
-        page.load()
-        result = play_by_title(
-            args.title, episode=args.episode, ui=ui, backend=backend, is_mobile=args.mobile
+        eff = source if source is not None else DEFAULT_SOURCE_INDEX
+        ui.toast(
+            f"ℹ 已给出视频页 URL，--title「{args.title}」忽略：\n"
+            f"    解析与起播都以该页面为准，剧名由页面识别；\n"
+            f"    想按片名搜索请去掉 URL：\n"
+            f"      python -m video_vip --title {args.title} -s {eff}"
         )
-        if result is None:
-            return 2
-        if not args.no_interact:
-            interactive(None, result, ui, cfg, save_opts=_save_opts(args),
-                        auto_next=args.auto_next, site=args.site)
-            result.backend.stop()
-        return 0
 
-    # 只给 URL：交给统一的「页面 URL → 注入 → 起播 → 交互」流程
+    # 统一的「页面 URL → 注入 → 起播 → 交互」流程（第三方源与无损云都走这里）
     return _play_page_url(args, ui, args.url, source)
 
 

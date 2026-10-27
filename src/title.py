@@ -43,6 +43,48 @@ _SPLIT_RE = re.compile(r"[-_\s（(|｜]")
 _EP_TAG_RE = re.compile(r"第.+[集季部]")
 _EP_NUM_RE = re.compile(r"第\d{1,8}[集期话季]")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 标题归一化（比对用）：各站/各源对同一部写法不一（「庆余年 第二季」/「庆余年第二季」、
+# 「年会不能停！」/「年会不能停」），先去高亮标签再去空白与装饰标点，才能判断是不是同一部。
+# site_search 的 _rank_by_title 与 wsyzy 的候选排序都复用这一套，避免两处口径漂移。
+# ─────────────────────────────────────────────────────────────────────────────
+_TITLE_MARK_RE = re.compile(r"</?(?:em|B)>")
+_TITLE_PUNCT_RE = re.compile(
+    r"[\s《》「」『』〈〉·・．.：:，,、\-—_~～!！?？'\"“”‘’]+")
+
+
+def strip_mark(s: Optional[str]) -> str:
+    """去掉接口标题里的 <em>/<B> 高亮标签与多余空白（保留词间单空格）。"""
+    s = _TITLE_MARK_RE.sub("", str(s or ""))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def norm_title(s: Optional[str]) -> str:
+    """标题归一化（比对用）：去高亮标签、空白与书名号/间隔号等装饰标点。"""
+    return _TITLE_PUNCT_RE.sub("", strip_mark(s))
+
+
+# 续集/分季编号：紧跟片名基干后的「第N部/季/期」或裸数字（阿拉伯或中文）。
+_SEQ_TAIL_RE = re.compile(
+    r"(?:第)?([0-9]{1,3}|[一二三四五六七八九十百]{1,4})(?:[部季期])?$")
+_SEQ_LEAD_RE = re.compile(
+    r"^(?:第)?([0-9]{1,3}|[一二三四五六七八九十百]{1,4})(?:[部季期])?")
+
+
+def is_numbered_sequel(query: Optional[str], name: Optional[str]) -> bool:
+    """判断 name 是不是 query 的「带编号续集」——归一化后 name 以 query 起头、
+    且多出来的部分紧跟一个序号（年会不能停 → 年会不能停2：水到渠成）。
+
+    query 自身已带编号（用户就搜「年会不能停2」）时一律 False，否则会误伤。
+    用于把用户没点名的续集在候选排序里压到本片之下。
+    """
+    nq, nn = norm_title(query), norm_title(name)
+    if not nq or not nn or nn == nq or not nn.startswith(nq):
+        return False
+    if _SEQ_TAIL_RE.search(nq):
+        return False
+    return bool(_SEQ_LEAD_RE.match(nn[len(nq):]))
+
 
 def wsyzy_clean_title(t: Optional[str]) -> str:
     """`wsyzyCleanTitle(t)`：剥掉书名号、平台名、"在线观看/正片"等噪声，
