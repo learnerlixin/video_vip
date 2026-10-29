@@ -4,49 +4,49 @@
 
 原来的 `EmbedBackend` 把第三方播放页塞进 iframe（`PLAYER + encodeURIComponent(url)`），
 然后用 `webbrowser.open` 打开一个 `file://` 页面。这个结构下 Python 完全看不到播放状态：
-iframe 跨域，读不到里面的 `<video>`，也收不到 `ended` 事件 —— 所以自动连播无从谈起。
+iframe 跨域，读不到里面的 `<video>`，也收不到任何播放事件。
 
-实测（见 README「自动连播」）无损云的 m3u8 与分片都返回 `Access-Control-Allow-Origin: *`
+实测无损云的 m3u8 与分片都返回 `Access-Control-Allow-Origin: *`
 且不加密封装，于是可以换一种结构：**用我们自己的页面 + hls.js 直接播 m3u8**。
-`<video>` 在我们手里，`ended` 就是真事件，不必靠时长去猜。
+`<video>` 在我们手里，播放事件（元数据 / 失败 / 回退 / 选集点击）都能回传给终端。
 
 页面要把事件送回 Python，就需要一个本地 HTTP 服务（`file://` 页面无法可靠回传）。
 本模块提供这个服务：既当静态服务器（页面 + hls.js），又当回调收集器（`/event`）。
 
 ## 一个标签页播完整部剧
 
-`play()` 原先每次都 `open_in_tab`，自动连播会开出一排标签页。这里改成：
+`play()` 原先每次都 `open_in_tab`，手动换集也会开出一排标签页。这里改成：
 Python 换集只是改服务端下发的 state（带一个新 token），页面自己切源。
-标签页只在「还没有活着的页面」时才开一次（实测连播 3 集只开 1 个标签）。
+标签页只在「还没有活着的页面」时才开一次（实测换 3 集只开 1 个标签）。
 
 页面拿 state 用 **`/wait` 长轮询**而不是 `setInterval` 轮询 `/state`：
 Chrome 会节流后台标签页的定时器（intensive throttling 最狠 1 分钟一次），
 用定时轮询的话，用户切到别的标签页时换集指令要等最多 1 分钟才被看到 ——
-表现为「播完了半天不切下一集」。长轮询是一次挂起的 HTTP 请求，不受节流影响
+表现为「点了选集半天不换源」。长轮询是一次挂起的 HTTP 请求，不受节流影响
 （实测 token 变化后 0.6s 内页面就切了源）。`/state` 仍保留作慢速兜底。
 
 ## 四种 state 模式
 
-* `hls`    —— 裸 m3u8，用 hls.js 直接播，**能**判断播完
-* `direct` —— 裸 mp4 等浏览器原生就能播的媒体流，**能**判断播完
+* `hls`    —— 裸 m3u8，用 hls.js 直接播，能收到页面回传的播放事件
+* `direct` —— 裸 mp4 等浏览器原生就能播的媒体流，能收到播放事件
   （`is_media_url()` 对 mp4 也返回 True，但 hls.js 播不了 mp4，必须分开处理）
-* `iframe` —— 第三方 HTML 解析页，只能塞 iframe，**不能**判断播完
+* `iframe` —— 第三方 HTML 解析页，只能塞 iframe，收不到任何事件
   （那种页面靠 JS 动态取流，实测 ffplay/mpv 一律 I/O error，hls.js 也无从下手）
 * `halt`   —— Python 侧退出：让页面停播并显示一行说明（见下）
 
 ## 页面内回退
 
 hls.js 播不了某个地址（CORS 被拦 / 清单 404 / 加密方式不支持）时，页面自己换成
-iframe 播 `PLAYER + url` 并回传 `fallback` 事件。**画面优先于「能不能自动连播」**：
-用户至少能看，Python 侧则据 `fallback` 把 `detectable()` 转 False，
-自动连播对这一集停用并明确告知，而不是静默失效或误判。
+iframe 播 `PLAYER + url` 并回传 `fallback` 事件。**画面优先**：
+用户至少能看，Python 侧则据 `fallback` 事件提示用户「这一集已回退到第三方
+播放页」，而不是静默失效。
 注意分片级的网络错误走的是「startLoad 重试」，不回退 —— 那种多半是抖动。
 
 ## 页面关闭的检测
 
 `pagehide` 里用 `navigator.sendBeacon('/bye')` 发信标（专为「卸载时也要送达」设计，
 关标签页/关浏览器都能到；普通 fetch 往往还没发出去页面就没了）。
-兜底是「心跳静默 > `_PAGE_CLOSED`」，阈值必须很宽松，因为后台标签页的定时器会被节流。
+`page_alive()` 先看这个信标（收到过就判死），再看心跳是否超过 `_PAGE_STALE`。
 一个坑：长轮询的 handler 线程在页面关掉后还会继续跑最多 `WAIT_LONGPOLL` 秒、
 期间一直刷新心跳，所以它**不能**清 `_page_bye`，否则信标会在 0.15s 内被抹掉；
 `page_alive()` 也要先看信标再看心跳，否则刚关掉的页面会被判成「还活着」，
@@ -78,11 +78,6 @@ HLSJS_CDNS = (
 # 页面每隔这么久上报一次心跳；超过 _PAGE_STALE 没心跳就认为页面已经关了
 HEARTBEAT_INTERVAL = 2.0
 _PAGE_STALE = 8.0
-# 「页面已关闭」的兜底判据：心跳静默超过这么久才算（仅在没有 pagehide 信标时用）。
-# 取得很宽松 —— 浏览器会节流后台标签页的定时器（Chrome 的 intensive throttling
-# 最狠能到每分钟一次），阈值太紧会把「正常播放但标签页在后台」误判成「已关闭」，
-# 从而错误停用自动连播。主判据是 pagehide 信标（关标签页/关浏览器都能送达）。
-_PAGE_CLOSED = 90.0
 # 页面轮询 /state 的间隔（仅作长轮询不可用时的兜底）
 STATE_POLL_INTERVAL = 0.8
 # /wait 长轮询一次最多挂这么久（秒）。到点就返回当前 state，页面立刻再发起下一次，
@@ -244,7 +239,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     if (p && p.catch) p.catch(function(){
       // 浏览器拦截了带声自动播放。报给 Python，让终端也提示一句 ——
       // 用户点过这一次之后，同一页面后续的 play() 就不会再被拦，
-      // 所以自动连播只需要在开头点一下。
+      // 所以手动换集也只需在开头点一下。
       showHint('▶ 点击此处开始播放', '（浏览器拦截了自动播放）');
       send('autoplay_blocked', {});
     });
@@ -262,8 +257,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
   // ── 回退到第三方播放页 ────────────────────────────────────────────────
   // hls.js 播不了（CORS 被拦 / 分片加密方式不支持 / 清单加载失败）时，
-  // 画面比「能不能自动连播」重要：回退成 iframe 塞 PLAYER 播放页，
-  // 用户照样能看，只是这一集收不到 ended 事件（Python 侧会告知）。
+  // 画面优先：回退成 iframe 塞 PLAYER 播放页，
+  // 用户照样能看（Python 侧会告知这一集已回退到第三方播放页）。
   function useFallback(reason){
     if (!fallbackUrl){
       L('✗ 播放失败：' + reason);
@@ -379,7 +374,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     Array.prototype.forEach.call(epBar.querySelectorAll('.ep'), function(el){
       el.addEventListener('click', function(){
         var n = parseInt(el.getAttribute('data-idx'), 10);
-        // 换集由 Python 侧执行（它要同步终端里的集号、计时与自动连播状态），
+        // 换集由 Python 侧执行（它要同步终端里的集号与选集栏高亮），
         // 页面只上报意图，等下一轮 /state 轮询把新源拿回来。
         fetch('/pick?idx=' + n, {cache:'no-store'}).catch(function(){});
       });
@@ -413,8 +408,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   });
   v.addEventListener('ended', function(){
     L('✓ 本集播完');
-    // 自动连播时 Python 会立刻换源；这几秒里画面是黑的，给个交代
-    showHint('✓ 本集播完', '正在切换下一集…（若长时间无反应，请在终端按 n）');
+    // 播完后不会自动换下集：提示用户如何手动接着看
+    showHint('✓ 本集播完', '若要接着看下一集，请在终端按 n 或点上方选集栏');
     send('ended', {currentTime: v.currentTime, duration: v.duration});
   });
   v.addEventListener('error', function(){
@@ -430,7 +425,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   // ── 拿 state：长轮询 + 心跳 ───────────────────────────────────────────
   // 为什么用长轮询而不是 setInterval 轮询 /state：
   // Chrome 会节流**后台标签页**的定时器（intensive throttling 最狠 1 分钟一次），
-  // 用户切到别的标签页时，自动连播的换集指令要等最多 1 分钟才被页面看到。
+  // 用户切到别的标签页时，终端里的换集指令要等最多 1 分钟才被页面看到。
   // 长轮询是一次挂起的 HTTP 请求，不受定时器节流影响，token 一变立刻返回。
   var stopped = false, lastWait = 0;
   function handleState(st){
@@ -536,7 +531,7 @@ class EmbedServer:
     """本地 HTTP 服务：托管播放页、下发 state、收集页面事件。
 
     线程模型：HTTP 服务跑在后台线程；`record_event` 由服务线程调用，
-    `state()` / `events` 由 AutoNext 的监视线程和 CLI 主线程读取，故全程加锁。
+    `state_json()` / `events` 由页面选集轮询线程和 CLI 主线程读取，故全程加锁。
     """
 
     def __init__(self, hlsjs_cache: Path, host: str = "127.0.0.1"):
@@ -559,16 +554,7 @@ class EmbedServer:
         # 页面回传的事件
         self._events: List[Dict[str, Any]] = []
         self._last_beat = 0.0
-        self._page_seen = False      # 是否收到过至少一次心跳（页面确实打开过）
         self._page_bye = False       # 是否收到过 pagehide 信标（页面被关/切走）
-        self._ended_token: Optional[int] = None
-        self._error_token: Optional[int] = None
-        self._error_detail = ""
-        self._duration: Optional[float] = None
-        self._playing_token: Optional[int] = None
-        # 页面实际在用的模式：hls/direct/native 能收到 ended，iframe 不能
-        self._live_mode = ""
-        self._fallback_token: Optional[int] = None
         # 一次性提示（回退、自动播放被拦等），由 CLI 取走后打印
         self._notices: List[str] = []
         self._picked_idx: Optional[int] = None
@@ -639,16 +625,6 @@ class EmbedServer:
             self._title = title
             self._fallback = fallback
             self._episodes = list(episodes)
-            # 新一集的这些状态全部作废。
-            # 注意 _notices 不在这里清：它是给 CLI 取走打印的一次性队列，
-            # 换集时清掉会让「上一集回退到 iframe」这类提示永远来不及显示。
-            self._ended_token = None
-            self._error_token = None
-            self._error_detail = ""
-            self._duration = None
-            self._playing_token = None
-            self._live_mode = ""
-            self._fallback_token = None
             return self._token
 
     def update_playlist(self, episodes: List[Dict[str, str]], idx: Optional[int] = None,
@@ -696,7 +672,7 @@ class EmbedServer:
 
         为什么不用页面 setInterval 轮询 /state：Chrome 对**后台标签页**的定时器
         有节流（intensive throttling 最狠 1 分钟一次），用户切到别的标签页时，
-        自动连播的换集指令要等最多 1 分钟才被页面看到 —— 表现为「播完了半天不切」。
+        终端里的换集指令要等最多 1 分钟才被页面看到 —— 表现为「点了选集半天不换源」。
         长轮询是一次挂起的 HTTP 请求，不受定时器节流影响，token 一变立刻返回。
 
         每次返回都顺手刷新心跳：长轮询本身就是「页面还活着」的证据，
@@ -711,10 +687,9 @@ class EmbedServer:
                 # 长轮询挂着 = 页面还活着，刷新心跳。
                 # 但**不能**在这里清 _page_bye：这个请求是页面关闭**之前**发起的，
                 # 它的 handler 会在页面关掉后继续跑最多 timeout 秒；若它清掉 bye，
-                # pagehide 信标就会在 0.15s 内被抹掉，page_closed() 永远测不到。
+                # pagehide 信标就会在 0.15s 内被抹掉，page_alive() 就测不出页面已关。
                 # bye 只由页面自己发的 beat/pageload 清除（回到前台/从 bfcache 恢复）。
                 self._last_beat = time.time()
-                self._page_seen = True
                 changed = self._token != last_token
                 payload = self._state_payload_locked()
             if changed:
@@ -753,61 +728,37 @@ class EmbedServer:
         with self._lock:
             self._events.append({"kind": kind, "token": tok, "at": time.time(),
                                  "raw": dict(ev)})
-            # 只留最近 200 条，长时间连播不至于无限涨
+            # 只留最近 200 条，长时间播放不至于无限涨
             if len(self._events) > 200:
                 del self._events[:-200]
             if kind == "beat":
                 self._last_beat = time.time()
-                self._page_seen = True
                 self._page_bye = False      # 页面又活了，清掉之前的关闭信标
             elif kind == "pageload":
                 self._last_beat = time.time()
-                self._page_seen = True
                 self._page_bye = False
             elif kind == "bye":
                 # pagehide 信标：页面被关或切到后台。重新出现心跳会清掉它。
                 self._page_bye = True
-            elif kind == "metadata":
-                # 只有当前这一集的 metadata 才算数
-                if tok == self._token:
-                    try:
-                        d = float(ev.get("duration") or 0)
-                        self._duration = d if d > 0 else None
-                    except (TypeError, ValueError):
-                        pass
             elif kind == "playing":
-                if tok == self._token:
-                    self._playing_token = tok
-                    self._last_beat = time.time()
-            elif kind == "ended":
-                if tok == self._token:
-                    self._ended_token = tok
+                # 起播也是一次「页面还活着」的证据，顺手刷新心跳
+                self._last_beat = time.time()
             elif kind == "halted":
                 # 页面确认已停播（stop() 里等这个回执再关服务）
                 self._halted = True
-            elif kind == "applied":
-                if tok == self._token:
-                    self._live_mode = ev.get("mode") or ""
             elif kind == "fallback":
                 if tok == self._token:
-                    self._fallback_token = tok
-                    # 回退到 iframe 之后收不到 ended，自动连播对这一集失效
-                    self._live_mode = "iframe"
                     detail = ev.get("detail") or "unknown"
                     self._notices.append(
                         f"⚠ 浏览器里 hls.js 播不了这一集（{detail}），"
-                        f"已回退到第三方播放页 —— 画面正常，但这一集无法自动连播"
+                        f"已回退到第三方播放页 —— 画面正常"
                     )
             elif kind == "autoplay_blocked":
                 if tok == self._token:
                     self._notices.append(
                         "⚠ 浏览器拦截了自动播放：请在播放页上点一下「▶ 点击此处开始播放」"
-                        "（点过一次之后，后续自动连播不会再被拦）"
+                        "（点过一次之后，后续换集不会再被拦）"
                     )
-            elif kind == "error":
-                if ev.get("fatal") == "true" and tok == self._token:
-                    self._error_token = tok
-                    self._error_detail = ev.get("detail") or "unknown"
 
     def pick(self, idx: int) -> None:
         """页面里点了选集栏：记下用户意图，由 Python 侧读取后走正常换集流程。"""
@@ -836,52 +787,6 @@ class EmbedServer:
         with self._lock:
             return self._idx
 
-    def ended(self, token: Optional[int] = None) -> bool:
-        with self._lock:
-            if self._ended_token is None:
-                return False
-            return token is None or self._ended_token == token
-
-    def failed(self, token: Optional[int] = None) -> bool:
-        with self._lock:
-            if self._error_token is None:
-                return False
-            return token is None or self._error_token == token
-
-    def error_detail(self) -> str:
-        with self._lock:
-            return self._error_detail
-
-    def duration(self) -> Optional[float]:
-        with self._lock:
-            return self._duration
-
-    def started_playing(self, token: Optional[int] = None) -> bool:
-        with self._lock:
-            if self._playing_token is None:
-                return False
-            return token is None or self._playing_token == token
-
-    def live_mode(self) -> str:
-        """页面当前实际在用的播放模式（'' 表示还没 applied）。"""
-        with self._lock:
-            return self._live_mode
-
-    def detectable(self) -> bool:
-        """这一集能不能收到 `ended`：没回退到 iframe、也没报错。
-
-        回退到 iframe 后 `<video>` 在我们手里是空的，第三方播放页跨域读不到，
-        自动连播必须停用（否则会拿旧的 ended 状态误判）。
-        注意这里**不看 page_alive**：页面刚打开、还没发第一次心跳时
-        detectable 也应为 True，否则 AutoNext 会因为「暂时没心跳」而误判不可用。
-        """
-        with self._lock:
-            if self._fallback_token is not None:
-                return False
-            if self._error_token is not None:
-                return False
-            return self._live_mode != "iframe"
-
     def page_alive(self, within: float = _PAGE_STALE) -> bool:
         """页面还活着吗。
 
@@ -896,35 +801,11 @@ class EmbedServer:
             beat = self._last_beat
         return bool(beat) and (time.time() - beat) <= within
 
-    def page_closed(self, stale_after: float = _PAGE_CLOSED) -> bool:
-        """播放页是不是被关掉了。
-
-        两个信号，任一成立即算关闭：
-
-        1. **pagehide 信标**（主）：页面在 `pagehide` 里用 `navigator.sendBeacon`
-           发一个 `/bye`。sendBeacon 专为「卸载时也要送达」设计，关标签页/关浏览器
-           都能到；重新打开或切回前台时页面会发心跳把它清掉。
-        2. **心跳长时间静默**（兜底，仅当页面曾经活过）：浏览器被强杀时 pagehide
-           不会触发，只能靠心跳断流判断。阈值取得比 `_PAGE_STALE` 宽松得多 ——
-           浏览器会节流后台标签页的定时器（最狠能到每分钟一次），阈值太紧会把
-           「正常播放但标签页在后台」误判成「已关闭」。
-
-        从没收到过心跳时一律返回 False：那是「浏览器还没把页面打开」，不是关闭。
-        """
-        with self._lock:
-            if self._page_bye:
-                return True
-            seen = self._page_seen
-            beat = self._last_beat
-        if not seen or not beat:
-            return False
-        return (time.time() - beat) > stale_after
-
     def wait_for_page(self, timeout: float = 25.0, poll: float = 0.15) -> bool:
         """阻塞等页面第一次心跳（浏览器已经打开并开始播）。
 
-        为什么需要：`play()` 之后 CLI 立刻会去探测时长、启动自动连播，
-        而浏览器起页面要几秒。等它真的活了再往下走，提示才不会打在起播之前。
+        为什么需要：`play()` 之后浏览器起页面要几秒，等它真的活了再往下走，
+        提示才不会打在起播之前。
         """
         deadline = time.time() + max(0.0, timeout)
         while time.time() < deadline:

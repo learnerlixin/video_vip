@@ -138,7 +138,7 @@ class Ui:
         else:                          # pragma: no cover
             self.console = None
         self._status: str = ""
-        # 后台线程（embed_open_watch / embed_poller / auto-next）会在主线程
+        # 后台线程（embed_open_watch / embed_poller）会在主线程
         # 阻塞于 input() 时打印 toast。rich 的 Console.input 先把提示符打到行尾
         # （不换行）再等输入，后台 print 会接在提示符后面并自带换行，导致提示符
         # 被盖掉、换行后一片空白，看着像「下一行不显示」。用一个锁 + 当前提示符
@@ -239,7 +239,7 @@ class Ui:
         `block` 才是**分块**依据，与颜色无关：同一条链路上的进度与结果（搜索 → 命中
         → 解析 → 起播）都是默认的 `flow`，连续打印时彼此不空行 —— 它们说的是同一件事，
         行间隔开会把工作流切成碎片。只有换来源才空行：`bg` 是后台线程插播（浏览器打开
-        回执、自动连播、预取里程碑），面板走 `section()` / `start_block()`。
+        回执、页面回退提醒、预取里程碑），面板走 `section()` / `start_block()`。
 
         soft_wrap=True：toast 是「一行状态」，不该被 rich 按词折行。
         rich 默认会在 `✓`/`⚠` 后面的空格处断行，长文案时把 emoji 甩成
@@ -419,7 +419,6 @@ class Ui:
             ("s [编号]", "换解析源（保持当前集）"),
             ("r", "重新加载"),
             ("a", "开关自动解析"),
-            ("x", "开关自动连播"),
             ("d", "保存当前集"),
             ("u", "打印直链"),
             ("h", "查看帮助"),

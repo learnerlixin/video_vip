@@ -75,31 +75,71 @@ def url_supported(url: str) -> bool:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _CONFIG_.videoParseList：解析源清单
-#   type 含 "1" → 内嵌播放（本地播放器 / 生成的内嵌 HTML 页）
-#   type 含 "3" → 弹窗播放不带选集（直接开浏览器新标签）
-#   wsyzy=True  → 无损云直连（suggest 搜索 → API 取 m3u8）
+#
+# kind 是**分流用的类别**，每条源都必须标注 —— 它决定「要不要一个具体视频页」，
+# 也就决定了命令行参数怎么校验、执行走哪条通路（见 cli._source_needs_page_url）：
+#   RESOURCE 资源型：源自带片库（maccms `provide/vod`），**按片名**检索就能拿到
+#            整季 m3u8 直链，不需要官方视频页；能不能立刻看到今天更新的那一集，
+#            取决于它的入库时刻（vod_time）。走 wsyzy.WsyzyDirect。
+#   COLLECT  采集型：现场从**一个具体视频页**采集（`url + 页面URL`），没有片名检索
+#            能力，一次只喂一集。走 consumer.show_player_window / jx_resolve。
+#
+# type 含 "1" → 内嵌播放（本地播放器 / 生成的内嵌 HTML 页）
+# type 含 "3" → 弹窗播放不带选集（直接开浏览器新标签）；资源型没有解析页可弹窗，
+#               所以全都只写 "1"。
 # ─────────────────────────────────────────────────────────────────────────────
+RESOURCE = "resource"
+COLLECT = "collect"
+
+
 @dataclass
 class ParseSource:
     name: str
     type: str
-    url: str = ""
-    wsyzy: bool = False
+    url: str = ""          # 采集型：解析页前缀（后面拼官方视频页 URL）
+    kind: str = COLLECT     # RESOURCE / COLLECT —— 所有源都必须明确自己的类别
+    api: str = ""           # 资源型：provide/vod 接口地址
+    suggest: str = ""       # 资源型：关了库内搜索的站只有官网联想接口（无损云）
+    badge: str = ""         # 菜单行尾的补充说明（站点特性，不是源名能表达的）
 
 
 VIDEO_PARSE_LIST: List[ParseSource] = [
-    ParseSource(name="无损云解析", type="1", wsyzy=True),
-    ParseSource(name="LX解析", type="1,3", url="https://jx.lxyy.club/index.php?url="),
-    ParseSource(name="789解析", type="1,3", url="https://jiexi.789jiexi.com/?url="),
-    ParseSource(name="冰豆解析", type="1,3", url="https://bd.jx.cn/?url="),
-    ParseSource(name="麒麟解析", type="1,3", url="https://free.maccms.xyz/?url="),
+    # 无损云的库内搜索是关的：`ac=detail&wd=` 直接回「暂不支持搜索」，只有官网
+    # suggest 能按片名换 id，所以 api 和 suggest 两个都得给（两条通路互斥）。
+    ParseSource(name="无损云解析", type="1", kind=RESOURCE,
+                api="https://api.wsyzy.net/api.php/provide/vod/",
+                suggest="https://wsyzy.cc",
+                badge="屏蔽欧美、欧洲线路"),
+    ParseSource(name="LX解析", type="1,3", url="https://jx.lxyy.club/index.php?url=", kind=COLLECT),
+    ParseSource(name="789解析", type="1,3", url="https://jiexi.789jiexi.com/?url=", kind=COLLECT),
+    ParseSource(name="冰豆解析", type="1,3", url="https://bd.jx.cn/?url=", kind=COLLECT),
+    ParseSource(name="麒麟解析", type="1,3", url="https://free.maccms.xyz/?url=", kind=COLLECT),
     # 以下 4 条为 2026-10 调研补充：逐个 requests 实测（拼真实优酷/腾讯官方页）确认可达、
     # 有效 SSL、返回真·播放器页（非域名停放/反爬占位/关停页），据 <title>/播放器库命名。
-    ParseSource(name="云解析", type="1,3", url="https://yparse.ik9.cc/index.php?url="),
-    ParseSource(name="CK播放器解析", type="1,3", url="https://www.ckplayer.vip/jiexi/?url="),
-    ParseSource(name="M3U8解析", type="1,3", url="https://jx.m3u8.tv/jiexi/?url="),
-    ParseSource(name="PlayM3U8解析", type="1,3", url="https://www.playm3u8.cn/jiexi.php?url="),
+    ParseSource(name="云解析", type="1,3", url="https://yparse.ik9.cc/index.php?url=", kind=COLLECT),
+    ParseSource(name="CK播放器解析", type="1,3", url="https://www.ckplayer.vip/jiexi/?url=", kind=COLLECT),
+    ParseSource(name="M3U8解析", type="1,3", url="https://jx.m3u8.tv/jiexi/?url=", kind=COLLECT),
+    ParseSource(name="PlayM3U8解析", type="1,3", url="https://www.playm3u8.cn/jiexi.php?url=", kind=COLLECT),
+    # 暴风/红牛：2026-10 调研新增的资源型站。选它们的两条硬指标（实测，非清单转载）：
+    #   * 入库快 —— 同一部当天更新的剧，暴风 12:07 / 红牛 12:20 已更到第 12 集，
+    #     而现用的无损云要到 14:13 才入库（无损云与最大/牛牛/闪电/丫丫共用同一条
+    #     片路径，属同链路下游，换它们不会变快）。
+    #   * 取流干净 —— 给的是 m3u8 直链，只带 UA（无 Referer）即可下分片。两家都没有官网
+    #     suggest（404），靠 `ac=detail&wd=` 搜片名。prefetch 的默认头里写死了
+    #     Referer=https://wsyzy.cc/，实测这两家的 CDN 对它不理（带与不带，playlist 与
+    #     分片都 200、字节数一致），所以 `d` / `--save` 通路一行没改。
+    ParseSource(name="暴风资源", type="1", kind=RESOURCE,
+                api="https://bfzyapi.com/api.php/provide/vod/"),
+    ParseSource(name="红牛资源", type="1", kind=RESOURCE,
+                api="https://hongniuzy2.com/api.php/provide/vod/from/hnm3u8/"),
 ]
+
+# 资源型源的下标：「没搜到可解析的官方页就回退按片名搜索」和 --save 的默认通路
+# 都取第一个（当前仍是无损云），列表增删时不必回头改硬编码的 0。
+RESOURCE_INDEXES: List[int] = [
+    i for i, s in enumerate(VIDEO_PARSE_LIST) if s.kind == RESOURCE
+]
+DEFAULT_RESOURCE_INDEX: int = RESOURCE_INDEXES[0] if RESOURCE_INDEXES else 0
 
 # 默认解析源：未显式 -s、交互菜单回车、--no-interact、bootstrap 回车都取它。
 # 按名称定位（而非硬编码下标），列表增删导致编号漂移时仍指向 LX解析；找不到则回退 0。

@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 
 from . import gm
 from .config import (
+    DEFAULT_RESOURCE_INDEX,
+    RESOURCE,
     Config,
     ParseSource,
     find_player_node,
@@ -40,7 +42,7 @@ class VipMenu:
 NOTES = [
     "1、本项目为开源项目，完全免费，请勿上当受骗",
     "2、视频内广告系资源自带，请勿轻信任何广告，可快进跳过",
-    "3、无损云解析为资源采集模式，已屏蔽欧美、欧洲线路",
+    "3、资源型源（无损云/暴风/红牛）走片库入库，当日更新有入库延迟；无损云另屏蔽欧美、欧洲线路",
     "4、如遇卡顿/无法加载，可切换不同线路/使用海外网络观看",
     "5、后续更新在 GitHub 仓库：88lin/video_vip",
     "6、资源均来自互联网公开分享，未提供资源上传、存储服务",
@@ -53,13 +55,13 @@ LINKS = {
     "web": "https://go.88lin.eu.org/vip",
 }
 
-# 自动解析的默认源。默认取 0（无损云）而不是 1（LX解析）：
-# LX解析返回的 HTML 播放页只有浏览器类后端能渲染，而默认后端是 ffplay/mpv
+# 自动解析的默认源：取**默认资源型源**（当前 = 0 无损云），而不是默认播放源 LX解析。
+# 理由：LX解析返回的 HTML 播放页只有浏览器类后端能渲染，而默认后端是 ffplay/mpv
 # 这类本地播放器，它们只认裸流，喂 HTML 一律
-# I/O error（实测 5 个第三方源全部如此）。index 0 = 无损云解析走的是直连模式，
+# I/O error（实测 5 个第三方源全部如此）。资源型走片库直连，
 # 返回真正的 m3u8，本地播放器能直接播。
-# 所以取 0：保证「自动解析能出画面」。
-DEFAULT_AUTO_SOURCE = 0
+# 所以取它：保证「自动解析能出画面」。
+DEFAULT_AUTO_SOURCE = DEFAULT_RESOURCE_INDEX
 
 
 def vip_box_css(box_id: str) -> str:
@@ -123,11 +125,14 @@ def vip_box_html(box_id: str, sources: List[ParseSource], auto_play: bool) -> st
     type_3_str = ""
     for index, item in enumerate(sources):
         # 直接把 ${item.name} 拼进 HTML 字符串会有注入风险，这里补上转义：
-        # 现有 7 个源名都不含 HTML 特殊字符，输出逐字节相同，但改列表时更安全。
+        # 现有源名都不含 HTML 特殊字符，输出逐字节相同，但改列表时更安全。
         name = html_escape(item.name)
-        if item.wsyzy:
+        if item.kind == RESOURCE:
+            # 资源型按片名搜库、没有解析页可弹窗，所以只进 [内嵌播放] 这个 ul；
+            # badge 是站点特性说明（无损云那条写着「屏蔽欧美、欧洲线路」）。
+            suffix = f"（{html_escape(item.badge)}）" if item.badge else ""
             type_1_str += (
-                f'<li class="nq-li" title="{name}（屏蔽欧美、欧洲线路）" '
+                f'<li class="nq-li" title="{name}{suffix}" '
                 f'data-index="{index}">{name}</li>'
             )
             continue
@@ -221,8 +226,9 @@ class Consumer:
     def generate_element(self) -> VipMenu:
         """`generateElement(container)`：拼 VIP 悬浮框 HTML → 产出终端菜单数据。
 
-        按 item.wsyzy / type.includes("1") / type.includes("3") 把解析源
-        分到两个 ul（[内嵌播放] 与 [弹窗播放不带选集]），这里保持同样的分组。
+        按 item.kind / type.includes("1") / type.includes("3") 把解析源
+        分到两个 ul（[内嵌播放] 与 [弹窗播放不带选集]），这里保持同样的分组：
+        资源型（RESOURCE）只有内嵌，采集型按 type 的两个标记各进一份。
         """
         menu = VipMenu(box_id=self.cfg.vipBoxId)
         for index, item in enumerate(self.cfg.videoParseList):
@@ -230,12 +236,12 @@ class Consumer:
                 "index": index,
                 "name": item.name,
                 "type": item.type,
-                "wsyzy": item.wsyzy,
+                "kind": item.kind,
                 "url": item.url,
-                # title 属性：无损云那条额外标注「屏蔽欧美、欧洲线路」
-                "title": f"{item.name}（屏蔽欧美、欧洲线路）" if item.wsyzy else item.name,
+                # title 属性：带 badge 的源把站点特性写在括号里（无损云「屏蔽欧美、欧洲线路」）
+                "title": f"{item.name}（{item.badge}）" if item.badge else item.name,
             }
-            if item.wsyzy:
+            if item.kind == RESOURCE:
                 menu.embedded.append(entry)
                 continue
             if "1" in item.type:
@@ -370,10 +376,10 @@ class Consumer:
 
     # ── showPlayerWindow ──────────────────────────────────────────────────
     def show_player_window(self, video_obj: ParseSource) -> Optional[PlayResult]:
-        """`showPlayerWindow(videoObj)`：无损云走直连，其余源拼 URL 交给后端/浏览器。"""
-        if video_obj.wsyzy:
+        """`showPlayerWindow(videoObj)`：资源型走片库直连，其余源拼 URL 交给后端/浏览器。"""
+        if video_obj.kind == RESOURCE:
             self.cfg.directMode = True
-            return self.play_direct()
+            return self.play_direct(video_obj)
 
         self.cfg.directMode = False
         if self.direct is not None:
@@ -421,7 +427,7 @@ class Consumer:
         浏览器类后端（embed/browser）。
 
         用户显式选的后端若能播 HTML 就沿用，否则退回 BrowserBackend，
-        并且不覆盖 self.backend（无损云直连仍用用户选的本地播放器）。
+        并且不覆盖 self.backend（资源型直连仍用用户选的本地播放器）。
         """
         preferred = self.backend or detect_backend(self.cfg)
         if getattr(preferred, "plays_html", False):
@@ -434,10 +440,15 @@ class Consumer:
             return BrowserBackend()
         return preferred
 
-    def play_direct(self) -> Optional[PlayResult]:
-        """`wsyzyDirect.play()`：无损云直连。"""
+    def play_direct(self, source: Optional[ParseSource] = None) -> Optional[PlayResult]:
+        """`wsyzyDirect.play()`：资源型站点按片名直连（无损云 / 暴风 / 红牛）。
+
+        `source` 决定连哪家库（api / suggest 都在它身上）；不传就是无损云，
+        保留给老的调用路径。
+        """
         self.cfg.directMode = True
-        self.direct = WsyzyDirect(self.cfg, self.page, self.ui, self.backend)
+        self.direct = WsyzyDirect(self.cfg, self.page, self.ui, self.backend,
+                                  source=source)
         result = self.direct.play()
         if result is not None:
             self.last_result = result

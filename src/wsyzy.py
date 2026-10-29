@@ -1,6 +1,6 @@
-"""wsyzy.py —— 无损云直连（wsyzyDirect）。
+"""wsyzy.py —— 资源型站点直连（wsyzyDirect）。
 
-    suggest_search(kw)      联想搜索
+    search_list(kw)         按片名搜库（官网联想 或 库内搜索，站点二选一）
     rank_candidates(...)    候选排序
     get_detail(hit)         取详情与选集
     cur_ep_num(...)         定位当前集
@@ -9,6 +9,9 @@
 
 流程：搜索 → 排序 → 详情 → 选集 → 播放。「播放」这一步把
 `PLAYER + encodeURIComponent(m3u8)` 交给选定的播放后端。
+
+名字还叫 wsyzy，但它已经不止无损云一家：凡是 `kind=RESOURCE` 的源（无损云、暴风、
+红牛）都走这套 maccms `provide/vod` 流程，站点地址从 `ParseSource.api/suggest` 注入。
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
 
 from . import net
-from .config import Config
+from .config import Config, ParseSource
 from .net import WsyzyError
 from .page import Window
 from .player import PLAYER, FrameLayout, PlayerBackend, Rect, build_player_frame_layout
@@ -37,6 +40,9 @@ from .util import (
     set_interval,
 )
 
+# 无损云（wsyzy.cc）的两个地址：模块默认值，也是历史入口。
+# 现在资源型站点由 config.VIDEO_PARSE_LIST 里每条源的 api/suggest 提供（暴风/红牛
+# 同形态不同域名），这两个常量只作为「没传 source 时」的兜底。
 SITE = "https://wsyzy.cc"
 API = "https://api.wsyzy.net/api.php/provide/vod/"
 
@@ -98,7 +104,14 @@ class TakeoverUi:
 
 
 class WsyzyDirect:
-    """无损云直连模块。一个实例对应一次 `wsyzyDirect.play()` 会话。"""
+    """资源型站点直连。一个实例对应一次 `wsyzyDirect.play()` 会话。
+
+    站点由 `source`（config.VIDEO_PARSE_LIST 里 `kind=RESOURCE` 的那条）注入：
+    `api` 是 provide/vod 接口，`suggest` 是官网域名。实测两者互斥 —— 无损云关了
+    库内搜索、只有官网联想；暴风/红牛没有官网、只能库内搜索，所以 `search_list`
+    按「有 suggest 走联想，否则走库内搜索」择一条路，两个字段都给全也没坏处。
+    不传 source 时仍是原来的无损云：历史调用点与测试都不用改。
+    """
 
     SITE = SITE
     API = API
@@ -110,11 +123,20 @@ class WsyzyDirect:
         page: PageSession,
         ui: Optional[Ui] = None,
         backend: Optional[PlayerBackend] = None,
+        source: Optional[ParseSource] = None,
     ):
         self.cfg = cfg
         self.page = page
         self.ui = ui or Ui()
         self.backend = backend
+        self.source = source
+        # api 是必需的（详情/选集全靠它），缺了才退回无损云；
+        # suggest 是**可无**的：暴风/红牛就没有官网，给了 source 就照它说的算，
+        # 这里绝不能用 SITE 兜底 —— 否则会把「在暴风搜片名」悄悄变成「在无损云搜」。
+        # api 必须带尾斜杠（后面直接拼 `?ac=`），suggest 必须不带（后面拼路径）。
+        self.api = ((source.api if source else "") or API).rstrip("/") + "/"
+        self.suggest = (source.suggest if source else SITE).rstrip("/")
+        self.src_name = source.name if source and source.name else "无损云"
         self._running = False
         self._aborted = False
         self._takeover_timeout = False
@@ -135,14 +157,27 @@ class WsyzyDirect:
 
     # ── 搜索 ──────────────────────────────────────────────────────────────
     def search_list(self, title: str) -> List[Dict[str, Any]]:
-        """`searchList(title)`：官网联想接口，过滤掉缺 id/name 的项。"""
-        url = f"{SITE}/index.php/ajax/suggest?mid=1&wd={quote(title, safe='')}"
-        j = net.req_json(url)
+        """`searchList(title)`：按片名搜库，一律归一成 [{id, name}]。
+
+        两条通路按站点择一（实测互斥，见类 docstring）：
+          * 有官网 → `{suggest}/index.php/ajax/suggest?mid=1&wd=`，返回的就是 id/name；
+          * 没官网 → `{api}?ac=detail&wd=` 库内搜索，返回 maccms 全套 `vod_*` 字段，
+            这里摘出 vod_id/vod_name。搜索质量各家不同（暴风能给精确同名、红牛常常
+            只给一堆同名衍生短剧），所以下游的 rank_candidates 打分不能省。
+        """
+        if self.suggest:
+            j = net.req_json(
+                f"{self.suggest}/index.php/ajax/suggest"
+                f"?mid=1&wd={quote(title, safe='')}")
+            items = (j or {}).get("list") or []
+            return [x for x in items if x.get("id") and x.get("name")]
+        j = net.req_json(f"{self.api}?ac=detail&wd={quote(title, safe='')}")
         items = (j or {}).get("list") or []
-        return [x for x in items if x.get("id") and x.get("name")]
+        return [{"id": x.get("vod_id"), "name": x.get("vod_name")}
+                for x in items if x.get("vod_id") and x.get("vod_name")]
 
     def search_candidates(self, title: str) -> List[Dict[str, Any]]:
-        """`searchCandidates(title)`：官网联想偶发抖动，空结果自动重试一次。"""
+        """`searchCandidates(title)`：搜索接口偶发抖动，空结果自动重试一次。"""
         items: List[Dict[str, Any]] = []
         try:
             items = self.search_list(title)
@@ -225,14 +260,14 @@ class WsyzyDirect:
 
     def get_episodes(self, vod_id: Any) -> List[Dict[str, str]]:
         """`getEpisodes(id)`"""
-        j = net.req_json(f"{API}?ac=detail&ids={vod_id}")
+        j = net.req_json(f"{self.api}?ac=detail&ids={vod_id}")
         lst = (j or {}).get("list") or []
         v = lst[0] if lst else None
         return self.parse_eps(v.get("vod_play_url") if v else None)
 
     def get_details(self, ids: List[Any]) -> Dict[Any, Dict[str, Any]]:
         """`?ac=detail&ids=1,2,3` 一次拉全，返回 {vod_id: detail}。"""
-        j = net.req_json(f"{API}?ac=detail&ids={','.join(str(i) for i in ids)}")
+        j = net.req_json(f"{self.api}?ac=detail&ids={','.join(str(i) for i in ids)}")
         out: Dict[Any, Dict[str, Any]] = {}
         for d in (j or {}).get("list") or []:
             out[d.get("vod_id")] = d
@@ -401,14 +436,14 @@ class WsyzyDirect:
             if not title or len(title) < 2:
                 raise WsyzyError("无法识别片名")
 
-            ui_box.set_status(f"「{title}」无损云搜索中...")
-            self.ui.toast(f"「{title}」无损云搜索中...", False)
+            ui_box.set_status(f"「{title}」{self.src_name}搜索中...")
+            self.ui.toast(f"「{title}」{self.src_name}搜索中...", False)
 
             candidates = self.search_with_retry(title)
             if self._aborted:
                 raise WsyzyError("已取消")
             if not candidates:
-                raise WsyzyError(f"无损云未收录「{title}」，请切换其他解析源")
+                raise WsyzyError(f"{self.src_name}未收录「{title}」，请切换其他解析源")
 
             hit: Optional[Dict[str, Any]] = None
             if len(candidates) == 1:
@@ -486,9 +521,9 @@ class WsyzyDirect:
             self.ui.ep_bar(eps, idx, load, title=hit["name"])          # mountEpBar(...)
 
             self.ui.toast(
-                "✓ 无损云播放中（点右上角「☰ 选集」可换集）"
+                f"✓ {self.src_name}播放中（点右上角「☰ 选集」可换集）"
                 if self.cfg.isMobile
-                else f"✓ 无损云播放中（{backend.describe()}）"
+                else f"✓ {self.src_name}播放中（{backend.describe()}）"
             )
 
             ui_box.iframe_src = PLAYER + quote(eps[idx]["url"], safe="")

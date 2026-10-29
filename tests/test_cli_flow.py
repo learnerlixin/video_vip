@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""test_cli_flow.py —— cli 的七条行为契约的离线流程回归（不打网络、不真下载）。
+"""test_cli_flow.py —— cli 的九条行为契约的离线流程回归（不打网络、不真下载）。
 
 覆盖的都是「容易在后续改动里悄悄退化」的控制流，而不是单元取值：
 
@@ -16,6 +16,12 @@
     [7] 终端输出的两条视觉约定：**颜色看首符号**（✓ 绿 / ✗ 红 / ⚠ 黄 / 进度蓝灰，
         调用点不传样式），**分块看来源**（起播 + 选集网格同属 flow 不空行，后台插播
         bg、独立面板才留白，面板带细横线；用户敲的命令回显本身就是一条分隔线）。
+    [8] `s` 菜单里 **▶ 标出当前在用的解析源**：换源是在几家接口之间跳，没有基准就
+        等于盲选；弹窗播放另开浏览器窗口，只注「弹窗中」，不改终端会话在用的源。
+    [9] 每条源都自带 **kind 分类**（资源型=有片库、按片名搜；采集型=必须喂一个具体
+        视频页），字段与类别得对得上；CLI 的每条分流（要不要 URL、能不能弹窗、走不走
+        --title）只问 `_source_needs_page_url`；站点参数由源注入 `WsyzyDirect`，两条
+        搜索通路（官网联想 / 库内搜索）都归一成同一种候选形状。
 
 手法：`ui._input` 变成脚本喂入（ScriptUi），终端输出收进 LOG，网络函数打桩。
 `FakeConsumer/FakeResult` 只满足交互循环真正读到的那几个属性，`fake_enrich`
@@ -35,11 +41,14 @@ import sys
 import types
 from pathlib import Path
 from typing import List
+from urllib.parse import quote
 
 # 仓库根（tests -> video_vip -> AI_coding -> 仓库根）：用 __file__ 反推，不写死路径
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from AI_coding.video_vip.src import cli
+from AI_coding.video_vip.src import config as cfg_mod
+from AI_coding.video_vip.src import net as net_mod
 from AI_coding.video_vip.src import site_search
 from AI_coding.video_vip.src import ui as ui_mod
 
@@ -153,8 +162,8 @@ class FakeResult:
 
 
 class FakeConsumer:
-    """只满足交互循环真正读到的成员；假后端没有 can_detect_end，
-    AutoNext 的监控线程会直接判为不支持而空转，所以可以放心驱动整个循环。"""
+    """只满足交互循环真正读到的成员；假后端不提供 take_picked /
+    take_notices 等可选协议，因此页面选集轮询会直接跳过，可以放心驱动整个循环。"""
 
     def __init__(self, page_url, sel=1, result=None):
         self.page = types.SimpleNamespace(url=page_url)   # 会话最初那一页
@@ -167,6 +176,11 @@ class FakeConsumer:
 
     def toggle_auto(self):
         return False
+
+    def pick_popup(self, index):
+        """弹窗播放：假打开成功（[8] 用它验证「弹窗中」标记）。"""
+        calls.update(popup=index)
+        return True
 
     def reload_current_player(self):
         pass
@@ -325,7 +339,6 @@ stub(cli, "start", lambda url, ui=None, backend=None, page=None, auto=True,
                                               "url": PREFIXES[source] + url}],
                                             name="测试剧")))[1])
 stub(cli, "_enrich_thirdparty_episodes", fake_enrich)
-stub(cli, "probe_duration", lambda *a, **k: 0.0)
 
 calls.clear()
 LOG.clear()
@@ -365,6 +378,7 @@ print("[5] 一行式 m / s")
 print("=" * 70)
 
 # 纯函数层：折叠语法的解析规则
+_OOR = str(len(cli.VIDEO_PARSE_LIST))     # 越界编号：列表增删时不用回头改硬编码
 check("m 片名 site 站 能同时切出片名与站点",
       cli._split_site_arg("嫁金钗 site 爱奇艺") == ("嫁金钗", "爱奇艺", ""),
       str(cli._split_site_arg("嫁金钗 site 爱奇艺")))
@@ -382,7 +396,8 @@ check("源名模糊匹配（麒麟→4）", cli._resolve_source_arg("麒麟") ==
       str(cli._resolve_source_arg("麒麟")))
 check("M3U8 前缀唯一命中 7 而非 8", cli._resolve_source_arg("M3U8") == (False, 7, ""),
       str(cli._resolve_source_arg("M3U8")))
-check("编号越界报错", cli._resolve_source_arg("9")[1] is None, "")
+check("编号越界报错", cli._resolve_source_arg(_OOR)[1] is None,
+      f"{_OOR} 号不存在 → {cli._resolve_source_arg(_OOR)}")
 check("歧义源名报错并列候选", len(cli._resolve_source_arg("解析")[2]) > 0
       and cli._resolve_source_arg("解析")[1] is None, "")
 check("p 前缀=弹窗", cli._resolve_source_arg("p4") == (True, 4, "")
@@ -439,7 +454,7 @@ u, res = run_keys(["2", "s 麒麟"])
 check("s 源名 一行式换源（麒麟→4）",
       calls.get("start", [(-1, -1)])[-1] == (OFFICIAL[1], 4), str(calls.get("start")))
 
-u, res = run_keys(["2", "s 9"])
+u, res = run_keys(["2", f"s {_OOR}"])
 check("s 越界编号不执行", not calls.get("start") and res.index == 1, str(calls))
 
 u, res = run_keys(["n 3"])
@@ -612,6 +627,159 @@ sui = ui_mod.SilentUi()
 sui.toast("✓ 好了", False, block="bg")
 check("--quiet / 测试用的 SilentUi 也吃 block 关键字（签名一致，不会 TypeError）",
       sui.logs == ["✓ 好了"], str(sui.logs))
+
+print()
+print("=" * 70)
+print("[8] s 菜单：▶ 标出当前在用的解析源")
+print("=" * 70)
+
+# 换源就是把同一部影片在几家接口之间跳。菜单里不标基准，敲一次 `s` 就得重新回忆
+# 刚才用的是哪家；而弹窗播放只是浏览器里另开的窗口，**不改**终端会话在用的源，
+# 所以「当前」与「弹窗中」可以落在不同行上。
+# 这一段不碰网络：`s` 菜单与弹窗分支只走 consumer.pick_popup。
+u, _res = run_keys(["s"])
+menu = [line for line in LOG if line.strip() and not line.startswith("TOAST:")]
+arrows = [l for l in menu if "▶" in l]
+check("当前在用的源带 ▶（会话起在 1 号源）",
+      len(arrows) == 1 and arrows[0].startswith("  ▶ 1  "), str(arrows))
+check("其余源不带 ▶、编号列仍对齐",
+      any(l.startswith("    4  麒麟解析") for l in menu)
+      and not any("▶" in l for l in menu if not l.startswith("  ▶")), str(menu[:3]))
+
+u, _res = run_keys(["s", "p2", "s"])
+marks = [l for l in LOG if "▶" in l or "弹窗中" in l]
+check("弹窗播放后那一行注「弹窗中」",
+      any("弹窗中" in l and l.lstrip().startswith("2 ") for l in marks), str(marks))
+check("弹窗不改终端会话的源：第二次开菜单时 ▶ 仍在 1 号",
+      [l for l in marks if "▶" in l][-1].startswith("  ▶ 1  "), str(marks))
+
+# ───────────── [9] kind 分类：所有源都标注，分流只看它 ─────────────
+print()
+print("=" * 70)
+print("[9] 资源型 / 采集型：kind 字段的自洽与分流")
+print("=" * 70)
+
+# 两类源的因果链完全不同，混用不会报错、只会走错通路：
+#   资源型 RESOURCE —— 自带片库（maccms `provide/vod`），按**片名**搜就有整季 m3u8
+#     直链，所以必须有 api，也没有「可弹窗的解析页」这种东西；
+#   采集型 COLLECT  —— 现场解析**一个具体视频页**（`url + 页面URL`），必须有 url，
+#     给片名它无从下手。
+# kind 标错或字段漏填，得在这一层就被抓住，而不是等到运行时分流失配。
+L = cli.VIDEO_PARSE_LIST
+check("每条源都显式标注 kind（只有这两类，不允许漏标/第三种）",
+      all(s.kind in (cli.RESOURCE, cli.COLLECT) for s in L),
+      str([(s.name, s.kind) for s in L if s.kind not in (cli.RESOURCE, cli.COLLECT)]))
+check("资源型都给 api、不给 url",
+      all(s.api and not s.url for s in L if s.kind == cli.RESOURCE),
+      str([(s.name, bool(s.api), s.url) for s in L if s.kind == cli.RESOURCE]))
+check("采集型都给 url、不给 api",
+      all(s.url and not s.api for s in L if s.kind == cli.COLLECT),
+      str([(s.name, bool(s.url), s.api) for s in L if s.kind == cli.COLLECT]))
+check("资源型不带 type=3（弹窗要解析页，它们没有）",
+      all("3" not in s.type for s in L if s.kind == cli.RESOURCE),
+      str([(s.name, s.type) for s in L if s.kind == cli.RESOURCE]))
+check("默认回退目标指向一条资源型源（列表增删不用回头改硬编码 0）",
+      bool(cfg_mod.RESOURCE_INDEXES)
+      and cli.DEFAULT_RESOURCE_INDEX == cfg_mod.RESOURCE_INDEXES[0],
+      f"resource={cfg_mod.RESOURCE_INDEXES} default={cli.DEFAULT_RESOURCE_INDEX}")
+check("分流判据与 kind 等价：所有分支只问 _source_needs_page_url",
+      all(cli._source_needs_page_url(i) == (s.kind == cli.COLLECT)
+          for i, s in enumerate(L)),
+      str([(s.name, cli._source_needs_page_url(i)) for i, s in enumerate(L)]))
+
+# 实测两家的搜索通路互斥：无损云关了库内搜索（`ac=detail&wd=` 回「暂不支持搜索」）、
+# 只有官网 suggest；暴风/红牛没有官网（suggest 404）、只能库内搜索。所以资源型必须
+# 容得下两种形态，`search_list` 也不能只写一条路。
+SUG = [s for s in L if s.kind == cli.RESOURCE and s.suggest]
+LIB = [s for s in L if s.kind == cli.RESOURCE and not s.suggest]
+check("两种形态都在（有官网联想的 / 只能库内搜索的）",
+      bool(SUG) and bool(LIB),
+      f"suggest={[s.name for s in SUG]} api_only={[s.name for s in LIB]}")
+
+
+def direct_for(src):
+    """只喂站点参数，不看 play()：这里要验的是 api/suggest 的注入与归一。"""
+    return cli.WsyzyDirect(cli.Config(url="https://example.invalid/"),
+                           types.SimpleNamespace(url="https://example.invalid/",
+                                                 window=None),
+                           ui=ScriptUi(), source=src)
+
+
+d_lib = direct_for(LIB[0])
+check("没官网的资源型：api 归一带尾斜杠、suggest 保持空（不能用无损云官网兜底）",
+      d_lib.api == LIB[0].api.rstrip("/") + "/" and d_lib.suggest == "",
+      f"api={d_lib.api} suggest={d_lib.suggest!r}")
+check("源名跟着源走（用户可见文案不再写死无损云）",
+      d_lib.src_name == LIB[0].name, d_lib.src_name)
+d_sug = direct_for(SUG[0])
+check("有官网的资源型：suggest 去尾斜杠（后面拼路径），api 照样带",
+      d_sug.suggest == SUG[0].suggest.rstrip("/") and d_sug.api.endswith("/"),
+      f"suggest={d_sug.suggest!r} api={d_sug.api}")
+d_old = direct_for(None)
+check("不传 source 仍是无损云那对地址（历史调用点与用例不必改）",
+      d_old.api == cli.WsyzyDirect.API.rstrip("/") + "/"
+      and d_old.suggest == cli.WsyzyDirect.SITE,
+      f"api={d_old.api} suggest={d_old.suggest}")
+
+REQ = []
+
+
+def fake_json(url, **kw):
+    """假 provide/vod：按 URL 里的通路回各家的真实形状（不打真实站点）。"""
+    REQ.append(url)
+    if "/index.php/ajax/suggest" in url:
+        return {"list": [{"id": 21, "name": "赘婿"}, {"name": "缺 id 的噪声"}, {}]}
+    return {"list": [{"vod_id": 21, "vod_name": "赘婿",
+                      "vod_play_url": "第1集$https://cdn/1.m3u8#第2集$https://cdn/2.m3u8"}]}
+
+
+stub(net_mod, "req_json", fake_json)
+
+REQ.clear()
+hits = direct_for(LIB[0]).search_list("赘婿")
+check("没官网 → 库内搜索 ac=detail&wd=，域名取自该源",
+      len(REQ) == 1 and REQ[0].startswith(d_lib.api) and "?ac=detail&wd=" in REQ[0],
+      str(REQ))
+check("vod_id/vod_name 归一成 id/name（下游只认一种形状）",
+      hits == [{"id": 21, "name": "赘婿"}], str(hits))
+check("片名只编码一次（预先 quote 再交给 params 会二次编码成 %25E8…）",
+      REQ[0].endswith(f"wd={quote('赘婿')}") and "%25" not in REQ[0], REQ[0])
+
+REQ.clear()
+hits = direct_for(SUG[0]).search_list("赘婿")
+check("有官网 → 只发一次 suggest 请求，不碰库内搜索",
+      REQ == [f"{d_sug.suggest}/index.php/ajax/suggest?mid=1&wd={quote('赘婿')}"],
+      str(REQ))
+check("suggest 结果里缺 id/name 的行被丢掉（后面要按 id 取详情）",
+      hits == [{"id": 21, "name": "赘婿"}], str(hits))
+
+REQ.clear()
+eps = direct_for(LIB[0]).get_episodes(21)
+check("详情/选集也用该源的 api，不是硬编码无损云接口",
+      REQ == [f"{d_lib.api}?ac=detail&ids=21"], str(REQ))
+check("选集解析两家共用同一条（都是 $$$ / # 分隔）",
+      [e["name"] for e in eps] == ["第1集", "第2集"], str(eps))
+
+# 分类字段最终要落到「执行走哪条路」：采集型接不了 --title，资源型弹窗没意义。
+COL_SRC = next(i for i, s in enumerate(L) if s.kind == cli.COLLECT)
+try:
+    cli.play_by_title("赘婿", source=COL_SRC)
+    check("采集型走 --title 路径直接报错（不拿片名硬喂需要 URL 的源）", False, "没抛异常")
+except ValueError as e:
+    check("采集型走 --title 路径报错并点名是哪条源",
+          "采集型" in str(e) and L[COL_SRC].name in str(e), str(e))
+
+u, _res = run_keys([f"s p{cli.DEFAULT_RESOURCE_INDEX}"])
+check("一行式 `s p<资源型>` 被拒：不开弹窗、也不静默改成内嵌",
+      "popup" not in calls and "start" not in calls
+      and any("资源型" in line for line in LOG), str(calls))
+
+u, _res = run_keys(["s", f"p{cli.DEFAULT_RESOURCE_INDEX}", "q"])
+menu_reject = [line for line in LOG if line.startswith("TOAST:") and "弹窗" in line]
+check("菜单里 `p<资源型>` 同样被拒并留在菜单（可以接着改选别家）",
+      "popup" not in calls and menu_reject, str(menu_reject))
+
+restore()
 
 print()
 print("=" * 70)

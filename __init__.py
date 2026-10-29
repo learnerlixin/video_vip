@@ -1,7 +1,7 @@
 """video_vip —— 全网 VIP 视频解析播放的命令行工具。
 
 在爱奇艺/腾讯/优酷等视频页上识别片名，调用第三方解析源或无损云直连拿到
-m3u8/mp4 真流，再用本地播放器或浏览器播放；支持整季选集、自动连播、保存 mp4。
+m3u8/mp4 真流，再用本地播放器或浏览器播放；支持整季选集、保存 mp4。
 
 目录约定：本层只放与源码无关的东西（README / __init__ / __main__ / .gitignore
 以及 tests/），**全部源码在 `src/` 下**（含随包的 `src/bdjs/`）。这里是包入口，
@@ -16,7 +16,7 @@ m3u8/mp4 真流，再用本地播放器或浏览器播放；支持整季选集�
     src/page.py             window / document / location 的最小 DOM 兼容层
     src/util.py             DOM 工具 + 页面会话
     src/title.py            片名识别与清洗
-    src/wsyzy.py            无损云直连（搜索/排序/详情/选集/播放/中止）
+    src/wsyzy.py            资源型站点直连（无损云/暴风/红牛：搜索/排序/详情/选集/播放/中止）
     src/site_search.py      片名/集数 → 官方视频页 URL
     src/jx_resolve.py       第三方解析页 → 真·媒体直链
     src/player.py           播放页布局 + 播放后端
@@ -25,7 +25,6 @@ m3u8/mp4 真流，再用本地播放器或浏览器播放；支持整季选集�
     src/download.py         保存为 mp4
     src/ui.py               终端 UI（toast / 菜单 / 选集栏 / 进度条）
     src/consumer.py         解析源菜单与播放调度
-    src/autonext.py         自动连播监视器
     src/cli.py              命令行入口
 """
 from __future__ import annotations

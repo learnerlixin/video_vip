@@ -183,8 +183,7 @@ def probe_duration(target: Any, ffmpeg: Optional[str] = None,
 
     `target` 可以是本地路径，也可以是 m3u8/mp4 的网络地址 ——
     ffprobe 对 HLS 会直接按 playlist 里的 EXTINF 累加出总时长，
-    不必把分片下完（实测本地 m3u8 约 0.3s）。
-    自动连播靠它拿到「这一集应该播多久」，否则只能退化成一个粗糙的绝对下限。
+    不必把分片下完（实测本地 m3u8 约 0.3s）。下载完成后用它校验存下来的时长。
     """
     exe = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
     if not exe:

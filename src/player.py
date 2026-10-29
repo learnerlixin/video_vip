@@ -14,8 +14,8 @@
    PrefetchBackend             —— 并发预取分片到本地，再用本地播放器起播（弱网/卡顿时用）
    BrowserBackend              —— 用系统浏览器打开 PLAYER+url（等价于 iframe.src）
    EmbedBackend                —— 起本地 HTTP 服务托管自有播放页（hls.js 直接播 m3u8），
-                                  页面把真 `ended` 事件回传 → 支持自动连播；
-                                  服务起不来时退回 file:// 页面 + 第三方 iframe（不支持）
+                                  页面把播放事件回传给终端；
+                                  服务起不来时退回 file:// 页面 + 第三方 iframe
 
 detect_backend() 按 mpv → ffplay → embed → browser 的顺序挑第一个可用的；
 prefetch 不参与自动探测，需显式 --player prefetch（它会把整集下到本地，开销大）。
@@ -32,7 +32,6 @@ import shutil
 import subprocess
 import tempfile
 import threading
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -241,7 +240,14 @@ def apply_inline_styles(element: Any, styles: Optional[Dict[str, str]]) -> None:
 # 播放后端
 # ─────────────────────────────────────────────────────────────────────────────
 class PlayerBackend:
-    """播放后端接口：play(m3u8_url) 起播，stop() 停掉，is_alive() 查状态。"""
+    """播放后端接口：play(m3u8_url) 起播，stop() 停掉，is_alive() 查状态。
+
+    另有几个**可选**协议方法，基类故意不定义（CLI 用 getattr 探测，
+    只有需要的后端才实现）：
+        set_playlist(eps, idx, title)  把选集表交给后端（页面选集栏）
+        take_picked()   -> int|None    页面选集栏里点了哪一集（CLI 轮询取走）
+        take_notices()  -> [str]       页面回传的一次性提示（CLI 轮询打印）
+    """
 
     name = "base"
     label = "基类"
@@ -249,10 +255,6 @@ class PlayerBackend:
     # 靠 JS 动态取流的网页，实测 ffplay/mpv 一律 I/O error；只有浏览器类后端能渲染。
     # show_player_window 据此决定把解析页交给谁。
     plays_html = False
-    # 能否判断「这一集自己播完了」。自动连播的前提。
-    # False 表示该后端无法可靠判断（browser 后端：页面在浏览器里且是第三方跨域
-    # iframe，我们既看不到播放进度也收不到结束事件）。
-    can_detect_end = False
 
     def play(self, url: str, title: str = "") -> None:
         raise NotImplementedError
@@ -267,45 +269,12 @@ class PlayerBackend:
         """阻塞直到播放结束（终端后端用于「播完自动退出」）。"""
         return None
 
-    # ── 自动连播用的状态查询 ────────────────────────────────────────────────
-    # 另有三个**可选**协议方法，基类故意不定义（AutoNext / CLI 用 getattr 探测，
-    # 只有需要的后端才实现）：
-    #   end_confirmed() -> bool   权威结束信号：拿到了浏览器的真 `ended` 事件。
-    #                             AutoNext 见到它就直接算播完，跳过耗时启发式。
-    #   page_closed()   -> bool   播放页被用户关掉了（AutoNext 据此停用连播）。
-    #   take_picked()   -> int|None  页面选集栏里点了哪一集（CLI 轮询取走）。
-    #   take_notices()  -> [str]  页面回传的一次性提示（CLI 轮询打印）。
-    def finished_naturally(self) -> bool:
-        """本次播放是否「自己播完退出」—— 而非被 stop() 打断。
-
-        默认 False：拿不准就不要连播。误判成「播完」会导致疯狂跳集，
-        比不跳集严重得多。
-        """
-        return False
-
-    def elapsed_seconds(self) -> float:
-        """本次播放已经持续了多少秒（用于和 expected_duration 比对）。"""
-        return 0.0
-
-    def expected_duration(self) -> Optional[float]:
-        """当前内容的预期时长（秒）；拿不到返回 None。
-
-        为什么需要它：实测 ffplay 对「文件损坏」「文件不存在」也返回 rc=0，
-        退出码根本区分不了「播完」和「秒退失败」。唯一可靠的判据是耗时 ——
-        失败是零点几秒就退，真播完必然接近视频时长。
-        """
-        return None
-
     def describe(self) -> str:
         return self.label
 
 
 class ProcessBackend(PlayerBackend):
     """本地播放器进程（mpv / ffplay）的公共实现。"""
-
-    # ffplay 带 -autoexit 时播完会自己退出，所以能判断「播完」。
-    # mpv 默认播完也退出（--idle 才会留着），同样适用。
-    can_detect_end = True
 
     def __init__(self, exe: str, args_template: List[str], label: str):
         self.exe = exe
@@ -314,9 +283,6 @@ class ProcessBackend(PlayerBackend):
         self.name = Path(exe).stem
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.RLock()
-        self._started_at: float = 0.0     # 本次 play() 的时刻
-        self._stopped: bool = False       # 本次播放是否被 stop() 主动打断
-        self._duration: Optional[float] = None   # 调用方告知的预期时长
 
     def _build_args(self, url: str, title: str) -> List[str]:
         args = [self.exe]
@@ -328,15 +294,6 @@ class ProcessBackend(PlayerBackend):
             else:
                 args.append(token)
         return args
-
-    def set_expected_duration(self, seconds: Optional[float]) -> None:
-        """告知本次播放内容的预期时长，供 finished_naturally() 判定用。
-
-        不设置也能工作，只是判定会退化成「进程自己退出即算播完」，
-        那样遇到秒退的坏地址会误判。
-        """
-        with self._lock:
-            self._duration = float(seconds) if seconds and seconds > 0 else None
 
     def play(self, url: str, title: str = "") -> None:
         with self._lock:
@@ -351,19 +308,10 @@ class ProcessBackend(PlayerBackend):
                 stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
             )
-            self._started_at = time.time()
-            self._stopped = False
-            # 预期时长属于「上一个 URL」，必须清掉：
-            # 否则第 2 集会沿用第 1 集的时长，自动连播的耗时判定就全错了。
-            # 调用方（CLI）会在起播后异步探测新地址的时长再 set 回来。
-            self._duration = None
 
     def stop(self) -> None:
         with self._lock:
             proc, self._proc = self._proc, None
-            # 标记「被主动打断」：之后 finished_naturally() 必须返回 False，
-            # 否则自动连播会把「用户切集/退出」误判成「播完」而疯狂跳集。
-            self._stopped = True
         if proc is None:
             return
         try:
@@ -380,33 +328,6 @@ class ProcessBackend(PlayerBackend):
         with self._lock:
             proc = self._proc
         return bool(proc and proc.poll() is None)
-
-    def elapsed_seconds(self) -> float:
-        with self._lock:
-            start = self._started_at
-        return (time.time() - start) if start else 0.0
-
-    def finished_naturally(self) -> bool:
-        """进程已退出、且不是被 stop() 打断的 → 视为「自己播完」。
-
-        实测（ffplay 9.0.2，结论见 README「自动连播」一节）：ffplay 对损坏文件/
-        不存在文件同样返回 rc=0，退出码无法区分「播完」与「秒退失败」；
-        terminate()/kill() 才是 rc=1。
-        所以这里不看 rc，改由调用方（AutoNext）再用耗时做第二道校验。
-        """
-        with self._lock:
-            proc = self._proc
-            stopped = self._stopped
-        if stopped or proc is None:
-            return False
-        try:
-            return proc.poll() is not None
-        except OSError:
-            return False
-
-    def expected_duration(self) -> Optional[float]:
-        with self._lock:
-            return self._duration
 
     def wait(self) -> None:
         with self._lock:
@@ -565,21 +486,19 @@ function pick(el){{
 class EmbedBackend(PlayerBackend):
     """生成内嵌播放页并用浏览器打开。
 
-    有两种形态，能力差别很大：
+    有两种形态：
 
     1. **本地 HTTP 服务 + 自有页面 + hls.js 直接播 m3u8**（默认，`EmbedServer`）
-       `<video>` 元素在我们自己的页面里，`ended` 是浏览器派发的真事件，
-       所以这个形态**支持自动连播**（`can_detect_end=True`）。
+       `<video>` 元素在我们自己的页面里，播放事件（元数据 / 失败 / 回退 /
+       选集点击）能回传给终端。
        换集只是改服务端 state（带新 token），页面轮询到就自己切源 ——
        整部剧用一个标签页播完，不会开出一排标签。
     2. **`file://` 页面 + iframe 塞第三方播放页**（服务起不来时的兜底）
-       跨域 iframe 是黑盒，既读不到 `<video>` 也收不到 `ended`，
-       自动连播不可用（`can_detect_end=False`）。
+       跨域 iframe 是黑盒，既读不到 `<video>` 也收不到任何事件。
 
     形态 1 里还有一条页面内的回退：hls.js 播不了某个地址（CORS 被拦、
     加密方式不支持、清单 404）时，页面自己换成 iframe 播 `PLAYER + url`。
-    画面优先于「能不能自动连播」—— 用户至少能看，Python 侧会收到 `fallback`
-    事件并明确告知这一集不能连播。
+    画面优先 —— 用户至少能看，Python 侧会收到 `fallback` 事件并明确告知。
     """
 
     name = "embed"
@@ -612,11 +531,6 @@ class EmbedBackend(PlayerBackend):
         # 只保护「起本地服务」这一段（见 _ensure_server 注释）
         self._server_lock = threading.RLock()
 
-        # 本次播放的状态（自动连播判定用）
-        self._token: Optional[int] = None
-        self._started_at: float = 0.0
-        self._stopped: bool = False
-        self._duration_hint: Optional[float] = None
         self._page_url: Optional[str] = None
         self._mode: str = ""
 
@@ -643,8 +557,8 @@ class EmbedBackend(PlayerBackend):
     def _ensure_server(self) -> Optional[EmbedServer]:
         """起本地服务并灌入播放页；起不来（端口被占等）返回 None → 走 file:// 兜底。
 
-        整个「查 → 建 → 存」过程持 `_server_lock`：`play()` 可能被主循环、
-        自动连播监视线程、页面选集轮询线程同时调用，不串行化的话会各建一个服务，
+        整个「查 → 建 → 存」过程持 `_server_lock`：`play()` 可能被主循环与
+        页面选集轮询线程同时调用，不串行化的话会各建一个服务，
         多出来的那个白占一个端口且没人引用（永远关不掉）。
         """
         with self._server_lock:
@@ -722,19 +636,14 @@ class EmbedBackend(PlayerBackend):
         # 页面回退用的地址：媒体流套上 PLAYER（即 iframe.src），
         # 解析页本身就是回退目标，不用再套。
         fallback = "" if mode == "iframe" else player_url_for(url)
-        token = server.set_episode(idx, url, mode, page_title, episodes, fallback)
+        server.set_episode(idx, url, mode, page_title, episodes, fallback)
 
         with self._lock:
-            self._token = token
             self._mode = mode
-            self._started_at = time.time()
-            self._stopped = False
-            # 预期时长属于上一个 URL，必须清掉（同 ProcessBackend.play）
-            self._duration_hint = None
             self._path = None
             self._page_url = server.base_url
 
-        # 标签页只在「没有活着的页面」时开一次：自动连播换集靠 state 轮询，
+        # 标签页只在「没有活着的页面」时开一次：换集靠 state 轮询，
         # 否则一集一个标签页，一部剧下来能开出几十页。
         if not server.page_alive():
             gm.open_in_tab(self._page_url, active=True, insert=True, set_parent=True)
@@ -752,15 +661,11 @@ class EmbedBackend(PlayerBackend):
             self._path = path
             self._page_url = path.as_uri()
             self._mode = "iframe"
-            self._token = None
-            self._started_at = time.time()
-            self._stopped = False
-            self._duration_hint = None
         gm.open_in_tab(path.as_uri(), active=True, insert=True, set_parent=True)
 
     # ── 生命周期 ──────────────────────────────────────────────────────────
     def stop(self) -> None:
-        """停止：标记「被打断」（自动连播不能再判成播完）并收掉本地服务。
+        """停止：给页面下发 halt 并收掉本地服务。
 
         先给页面下一次 halt 状态、等它回一个 `halted` 再关服务：
         直接关的话页面还在播，用户会以为终端没退出干净。等不到回执（页面已关）
@@ -772,10 +677,8 @@ class EmbedBackend(PlayerBackend):
         """
         with self._server_lock:
             with self._lock:
-                self._stopped = True
                 server = self._server
                 self._server = None
-                self._token = None
             if server is None:
                 return
             server.halt()
@@ -789,88 +692,6 @@ class EmbedBackend(PlayerBackend):
         if server is not None:
             return server.running and server.page_alive()
         return path is not None
-
-    # ── 自动连播：页面回传的 ended 是**真事件**，不用靠耗时去猜 ──────────────
-    @property
-    def can_detect_end(self) -> bool:      # type: ignore[override]
-        """走本地服务且页面没回退到 iframe 时，能判断「播完」。
-
-        注意「页面还没加载完」不算不能：`AutoNext.start()` 只查一次这个属性，
-        此刻返回 False 会导致监视线程压根不启动，之后页面活了也没人盯着。
-        """
-        with self._lock:
-            server = self._server
-        if server is None or not server.running:
-            return False            # file:// 兜底：跨域 iframe 是黑盒
-        # 页面回退到 iframe / 报错 → 收不到 ended；否则（含「页面还没加载完」）
-        # 都算能判，让监视线程先起来，起播后自然生效。
-        return server.detectable()
-
-    def end_confirmed(self) -> bool:
-        """**权威**结束信号：浏览器真的派发了 `ended`（不是靠耗时推测）。
-
-        AutoNext 认这个信号：拿到就直接算播完，跳过「耗时 ≥ 时长 60%」那套
-        启发式 —— 那套是为「ffplay 退出码区分不了播完与秒退」设计的，
-        页面里的 `ended` 没有这个歧义。
-        """
-        with self._lock:
-            server, token, stopped = self._server, self._token, self._stopped
-        if server is None or token is None or stopped:
-            return False
-        return server.ended(token)
-
-    def finished_naturally(self) -> bool:
-        """本次播放是否「自己播完」—— 而非被 stop() 打断。"""
-        return self.end_confirmed()
-
-    def failed(self) -> bool:
-        """这一集在页面里彻底播不了（hls.js 失败且没有可回退的地址）。"""
-        with self._lock:
-            server, token = self._server, self._token
-        if server is None or token is None:
-            return False
-        return server.failed(token)
-
-    def failure_detail(self) -> str:
-        with self._lock:
-            server = self._server
-        return server.error_detail() if server is not None else ""
-
-    def elapsed_seconds(self) -> float:
-        with self._lock:
-            start = self._started_at
-        return (time.time() - start) if start else 0.0
-
-    def expected_duration(self) -> Optional[float]:
-        """优先用页面 `loadedmetadata` 报回来的真实时长，其次才是 CLI 探的。"""
-        with self._lock:
-            server = self._server
-            hint = self._duration_hint
-        if server is not None:
-            dur = server.duration()
-            if dur and dur > 0:
-                return float(dur)
-        return hint
-
-    def set_expected_duration(self, seconds: Optional[float]) -> None:
-        with self._lock:
-            self._duration_hint = float(seconds) if seconds and seconds > 0 else None
-
-    def page_alive(self) -> bool:
-        """播放页还在不在（心跳没断）。CLI 据此提示「页面被关了」。"""
-        with self._lock:
-            server = self._server
-        return bool(server and server.page_alive())
-
-    def page_closed(self) -> bool:
-        """播放页被关掉了（pagehide 信标，或心跳长时间静默）。
-
-        AutoNext 据此停用连播 —— 页面都没了，换集请求发出去也没人执行。
-        判定细节（含为什么阈值要宽松）见 EmbedServer.page_closed。
-        """
-        with self._lock:
-            server = self._server
-        return bool(server and server.page_closed())
 
     def take_picked(self) -> Optional[int]:
         """页面选集栏里点了哪一集（一次性取走）。"""
@@ -908,32 +729,26 @@ class EmbedBackend(PlayerBackend):
             return self._server
 
     def describe(self) -> str:
-        """一句话说明「现在怎么播、能不能自动连播」。
+        """一句话说明「现在怎么播」。
 
         文案要短：它会被拼进「✓ 无损云播放中（...）」这类整行输出，而 rich
         按显示宽度折行（中日韩算 2 列），默认终端只有 79 列。实测长文案会把
         整行撑到 82 列、在词中间断行（「hls.js 直播\nm3u8」）。折行本身已由
         ui.toast 的 soft_wrap=True 兜住，这里保持短是为了窄终端也读得顺。
-
-        「可连播」必须与 can_detect_end 一致，不能只看模式名字好听：
-        iframe（第三方解析页）里 `<video>` 不在我们手上、跨域读不到，
-        detectable() 返回 False，自动连播是停用的 —— 说「可连播」就是骗人。
         """
         with self._lock:
             server = self._server
             mode = self._mode
             file_only = self._server_failed or not self.use_server
         if server is not None and server.running:
-            # 权威判据就是 can_detect_end 自己，别再另写一份模式表（会漂移）
             if mode == "iframe":
-                return f"{self.label}·第三方解析页，不可连播"
+                return f"{self.label}·第三方解析页"
             kind = {"hls": "hls.js", "direct": "原生"}.get(mode, "自有页")
-            tail = "可连播" if self.can_detect_end else "不可连播"
-            return f"{self.label}·{kind}，{tail}"
+            return f"{self.label}·{kind}"
         if file_only:
-            return f"{self.label}·file:// 兜底，不可连播"
-        # 还没起播：默认会走本地服务 + hls.js，能力以「可连播」为准
-        return f"{self.label}·hls.js，可连播"
+            return f"{self.label}·file:// 兜底"
+        # 还没起播：默认会走本地服务 + hls.js
+        return f"{self.label}·hls.js"
 
 
 class PrefetchBackend(PlayerBackend):
@@ -1144,45 +959,6 @@ class PrefetchBackend(PlayerBackend):
             player_alive = self._player.is_alive() if self._player else False
             pf = self._prefetcher
         return player_alive or bool(pf and not pf.cancelled and pf.done < pf.total)
-
-    # ── 自动连播：透传内部播放器的判定 ─────────────────────────────────────
-    # 注意 is_alive() 会把「后台还在下分片」也算作活着，所以自动连播不能看它，
-    # 要看内部播放器进程是否自己退出了。
-    @property
-    def can_detect_end(self) -> bool:      # type: ignore[override]
-        with self._lock:
-            inner = self._player
-        return bool(inner and getattr(inner, "can_detect_end", False))
-
-    def finished_naturally(self) -> bool:
-        with self._lock:
-            inner = self._player
-        return bool(inner and inner.finished_naturally())
-
-    def elapsed_seconds(self) -> float:
-        with self._lock:
-            inner = self._player
-        return inner.elapsed_seconds() if inner else 0.0
-
-    def expected_duration(self) -> Optional[float]:
-        """优先用清单里的真实时长（比调用方猜的准）。"""
-        with self._lock:
-            pf = self._prefetcher
-            inner = self._player
-        if pf is not None:
-            try:
-                dur = pf.stream.total_duration
-                if dur and dur > 0:
-                    return float(dur)
-            except Exception:
-                pass
-        return inner.expected_duration() if inner else None
-
-    def set_expected_duration(self, seconds: Optional[float]) -> None:
-        with self._lock:
-            inner = self._player
-        if inner is not None and hasattr(inner, "set_expected_duration"):
-            inner.set_expected_duration(seconds)
 
     def wait(self) -> None:
         with self._lock:
