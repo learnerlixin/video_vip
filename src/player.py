@@ -700,7 +700,7 @@ class EmbedBackend(PlayerBackend):
         return server.take_picked() if server is not None else None
 
     def take_notices(self) -> List[str]:
-        """页面回传的一次性提示（回退到 iframe / 自动播放被拦）。"""
+        """页面回传的一次性提示（回退到 iframe / 需点击起播）。"""
         with self._lock:
             server = self._server
         return server.take_notices() if server is not None else []

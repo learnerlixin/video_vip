@@ -188,7 +188,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
               referrerpolicy="no-referrer"></iframe>
     </div>
     <div id="hint"><div id="hintMain">▶ 点击此处开始播放</div>
-      <div style="font-size:12px;opacity:.7" id="hintSub">（浏览器拦截了自动播放）</div></div>
+      <div style="font-size:12px;opacity:.7" id="hintSub">（浏览器要求点击一次才能播放）</div></div>
     <div class="ep-bar" id="epBar"></div>
     <div class="ep-trigger" id="epTrigger"></div>
     <div id="stat"></div>
@@ -237,10 +237,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   function tryPlay(){
     var p = v.play();
     if (p && p.catch) p.catch(function(){
-      // 浏览器拦截了带声自动播放。报给 Python，让终端也提示一句 ——
+      // 浏览器拦下了带声自动起播（autoplay 策略）。报给 Python，让终端也提示一句 ——
       // 用户点过这一次之后，同一页面后续的 play() 就不会再被拦，
       // 所以手动换集也只需在开头点一下。
-      showHint('▶ 点击此处开始播放', '（浏览器拦截了自动播放）');
+      showHint('▶ 点击此处开始播放', '（浏览器要求点击一次才能播放）');
       send('autoplay_blocked', {});
     });
   }
@@ -555,7 +555,7 @@ class EmbedServer:
         self._events: List[Dict[str, Any]] = []
         self._last_beat = 0.0
         self._page_bye = False       # 是否收到过 pagehide 信标（页面被关/切走）
-        # 一次性提示（回退、自动播放被拦等），由 CLI 取走后打印
+        # 一次性提示（回退、需点击起播等），由 CLI 取走后打印
         self._notices: List[str] = []
         self._picked_idx: Optional[int] = None
         # 页面是否已回应 halt（stop() 时等它真的停下来）
@@ -754,11 +754,9 @@ class EmbedServer:
                         f"已回退到第三方播放页 —— 画面正常"
                     )
             elif kind == "autoplay_blocked":
-                if tok == self._token:
-                    self._notices.append(
-                        "⚠ 浏览器拦截了自动播放：请在播放页上点一下「▶ 点击此处开始播放」"
-                        "（点过一次之后，后续换集不会再被拦）"
-                    )
+                # 不往终端推送：浏览器本来就需要用户点一下才能带声起播，
+                # 页面上已有「▶ 点击此处开始播放」遮罩，终端再打一行反而噪声。
+                pass
 
     def pick(self, idx: int) -> None:
         """页面里点了选集栏：记下用户意图，由 Python 侧读取后走正常换集流程。"""
@@ -773,7 +771,7 @@ class EmbedServer:
             return idx
 
     def take_notices(self) -> List[str]:
-        """取出并清空待打印的一次性提示（回退 / 自动播放被拦）。"""
+        """取出并清空待打印的一次性提示（回退 / 需点击起播）。"""
         with self._lock:
             out, self._notices = self._notices, []
             return out

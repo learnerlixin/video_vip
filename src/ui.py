@@ -138,7 +138,7 @@ class Ui:
         else:                          # pragma: no cover
             self.console = None
         self._status: str = ""
-        # 后台线程（embed_open_watch / embed_poller）会在主线程
+        # 后台线程（embed_poller）会在主线程
         # 阻塞于 input() 时打印 toast。rich 的 Console.input 先把提示符打到行尾
         # （不换行）再等输入，后台 print 会接在提示符后面并自带换行，导致提示符
         # 被盖掉、换行后一片空白，看着像「下一行不显示」。用一个锁 + 当前提示符

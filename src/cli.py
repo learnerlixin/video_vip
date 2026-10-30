@@ -1084,7 +1084,7 @@ def interactive(
             return (index, popup)
 
     # embed 后端的播放页在浏览器里，用户在页面选集栏点了某一集、或页面回退到
-    # 第三方 iframe / 自动播放被拦时，这些事件是通过本地 HTTP 服务回传的。
+    # 第三方 iframe / 需要点击起播时，这些事件是通过本地 HTTP 服务回传的。
     # 主循环阻塞在 ui._input() 上收不到，所以起一个后台线程轮询：
     #   * take_picked() → 走 switch_to()（和终端里敲数字同一条路径，集号与选集栏才同步）
     #   * take_notices() → 打印一行提示
@@ -1131,31 +1131,23 @@ def interactive(
 
     threading.Thread(target=embed_poller, name="embed-poll", daemon=True).start()
 
-    # embed 后端：确认浏览器真的把播放页打开了。
-    # 为什么值得单独等：浏览器起页面要几秒，而万一压根没打开成功（没有默认
-    # 浏览器、被安全软件拦了），用户只会看到一个光秃秃的 `video_vip>` 提示符，
-    # 完全不知道发生了什么。放独立线程里等，不阻塞提示符（本地播放器后端
-    # 没有 wait_for_page，线程会立刻退出）。
-    def embed_open_watch() -> None:
-        backend = result.backend if result is not None else None
-        waiter = getattr(backend, "wait_for_page", None) if backend is not None else None
-        if not callable(waiter):
-            return
+    # embed 后端：等浏览器真的把播放页打开，把结果作为**一行正常终端输出**打在
+    # 进入交互循环（第一个 `video_vip>` 提示符）之前 —— 而不是循环里由后台线程
+    # 插进提示符区。本地播放器后端没有 wait_for_page，直接跳过（不打扰）。
+    _open_backend = result.backend if result is not None else None
+    _waiter = getattr(_open_backend, "wait_for_page", None) if _open_backend is not None else None
+    if callable(_waiter):
         try:
-            opened = bool(waiter(15.0))
+            _opened = bool(_waiter(15.0))
         except Exception:
-            return                  # 查询失败不该吵人，交互循环照常
-        if embed_stop.is_set():
-            return                  # 用户已经退出了，别再打一行
-        if opened:
-            page_url = getattr(backend, "page_url", None)
-            ui.toast(f"✓ 播放页已在浏览器打开{('：' + page_url) if page_url else ''}",
+            _opened = False                  # 查询失败不该吵人，交互循环照常
+        if _opened:
+            _page_url = getattr(_open_backend, "page_url", None)
+            ui.toast(f"✓ 播放页已在浏览器打开{('：' + _page_url) if _page_url else ''}",
                      False, block="bg")
         else:
             ui.toast("⚠ 浏览器没能打开播放页（没有默认浏览器？）。"
                      "可改用 --player mpv / ffplay 在本地播放", False, block="bg")
-
-    threading.Thread(target=embed_open_watch, name="embed-open", daemon=True).start()
 
     try:
         while True:
